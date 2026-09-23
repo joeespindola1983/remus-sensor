@@ -21,6 +21,7 @@ public:
   bool enhancedNavigationAvailable() const override { return ubxNavigationActive_; }
   bool navigationSolutionUpdated() const override;
   uint32_t gpsTimeOfWeekMs() const override { return navigation_.iTowMs; }
+  uint32_t navigationReceivedAtMs() const override { return navigation_.receivedAtMs; }
   uint32_t groundSpeedCmPerSecond() const override {
     return ubxNavigationActive_ ? navigation_.groundSpeedCmS
                                 : static_cast<uint32_t>(gps_.speed.kmph() * 27.7777778f);

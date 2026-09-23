@@ -35,7 +35,7 @@
 
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define REMUS_FIRMWARE_VERSION "0.3.1"
+#define REMUS_FIRMWARE_VERSION "0.3.2"
 
 // Binary session records live in remus-core and are shared with Prototype 2.
 using RemusFileHeader = remus::session::FileHeader;
@@ -103,6 +103,12 @@ volatile bool isWorkoutActive = false;
 volatile unsigned long imuGapCount = 0;
 volatile unsigned long maxImuGapMs = 0;
 volatile unsigned long imuReadFailureCount = 0;
+volatile unsigned long gpsEpochsReceived = 0;
+volatile unsigned long gpsValidEpochs = 0;
+volatile unsigned long gpsInvalidEpochs = 0;
+volatile unsigned long gpsItowGapCount = 0;
+volatile unsigned long gpsMaxItowGapMs = 0;
+uint32_t previousGpsItowMs = UINT32_MAX;
 bool gpsSnapshotDirty = false;
 unsigned long lastGpsNvsPersist = 0;
 constexpr unsigned long GPS_NVS_IDLE_INTERVAL_MS = 60000;
@@ -111,6 +117,7 @@ constexpr unsigned long GPS_NVS_IDLE_INTERVAL_MS = 60000;
 volatile bool isTransferActive = false;
 uint32_t transferTotalBytes = 0;
 uint32_t transferOffset = 0;
+uint32_t transferCrcState = 0xFFFFFFFFUL;
 unsigned long lastTransferChunk = 0;
 
 // Estado síncrono da última tentativa de notification usada pelo download.
@@ -556,6 +563,12 @@ void startWorkoutRecording() {
   __atomic_store_n(&imuReadFailureCount, 0UL, __ATOMIC_RELAXED);
   __atomic_store_n(&ringBufferOverflowCount, 0UL, __ATOMIC_RELAXED);
   __atomic_store_n(&liveSpmQueueDropCount, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&gpsEpochsReceived, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&gpsValidEpochs, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&gpsInvalidEpochs, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&gpsItowGapCount, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&gpsMaxItowGapMs, 0UL, __ATOMIC_RELAXED);
+  previousGpsItowMs = UINT32_MAX;
 
   // Nova geração de preview. Primeiro desabilita/invalida qualquer trabalho
   // antigo; a task de SPM fará reset ao receber a primeira amostra nova.
@@ -751,6 +764,7 @@ void startFileTransfer(const String& targetFile) {
 
   transferTotalBytes = transferFile.size();
   transferOffset = 0;
+  transferCrcState = 0xFFFFFFFFUL;
   transferPacketCount = 0;
   transferLastLoggedPercent = -10;
   __atomic_store_n(&transferNotifyErrors, 0UL, __ATOMIC_RELAXED);
@@ -796,7 +810,9 @@ void processFileTransfer() {
     // FILE_END também passa pela mesma validação de enqueue. O app só resolve
     // o download depois desta mensagem, então não encerramos silenciosamente.
     char endBuf[112];
-    snprintf(endBuf, sizeof(endBuf), "FILE_END:%s:%u", currentTransferFileName, transferOffset);
+    const uint32_t completedCrc = ~transferCrcState;
+    snprintf(endBuf, sizeof(endBuf), "FILE_END:%s:%u:%08lX", currentTransferFileName,
+      transferOffset, (unsigned long)completedCrc);
     const bool endOk = sendTransferText(endBuf, 30);
 
     Serial.printf("[TRANSFER] %s Total=%u B, packets=%lu, notifyErrors=%lu, retries=%lu\n",
@@ -848,6 +864,14 @@ void processFileTransfer() {
     // um backoff maior. Se o telefone desconectar, o callback encerra tudo.
     delay(8);
     return;
+  }
+
+  for (int i = 0; i < bytesRead; ++i) {
+    transferCrcState ^= chunkBuf[7 + i];
+    for (uint8_t bit = 0; bit < 8; ++bit) {
+      transferCrcState = (transferCrcState >> 1) ^
+        (0xEDB88320UL & (0UL - (transferCrcState & 1UL)));
+    }
   }
 
   transferOffset = currentOffset + (uint32_t)bytesRead;
@@ -1540,13 +1564,33 @@ void liveSpmProcessingTask(void* pvParameters) {
         }
         xSemaphoreGive(recordingStateMutex);
       }
-    } else if (spmRes.progress >= 1.0) {
-      // Só chega aqui quando o estimator realmente perdeu o lock (hold expirou
-      // ou houve sinal quieto por tempo suficiente). Uma janela fraca isolada
-      // não derruba mais a UI imediatamente para zero.
+    } else if (spmRes.progress >= 1.0 && spmRes.reason == "recent_quiet") {
+      // Zero significa parada confirmada. Janela fraca, ambígua ou sem dados
+      // não é convertida em zero, nem na UI nem no arquivo.
       portENTER_CRITICAL(&telemetryMux);
+      const bool stoppedFromActiveCadence = liveSpm > 0.0f;
       liveSpm = 0.0f;
       portEXIT_CRITICAL(&telemetryMux);
+
+      // Zero is evidence of a confirmed stop, not a substitute for an
+      // unavailable/ambiguous estimate. Emit exactly on the non-zero -> quiet
+      // transition; subsequent quiet windows see liveSpm already at zero.
+      if (stoppedFromActiveCadence && recordingStateMutex && s_recordingRingBuf) {
+        RemusSpmRecord spmRec{};
+        spmRec.type = 0x03;
+        spmRec.timestamp_ms = sample.timestamp_ms;
+        spmRec.spm_x10 = 0;
+        xSemaphoreTake(recordingStateMutex, portMAX_DELAY);
+        if (isWorkoutActive && sample.generation ==
+            __atomic_load_n(&liveSpmGeneration, __ATOMIC_RELAXED)) {
+          if (xRingbufferSend(s_recordingRingBuf, &spmRec, sizeof(spmRec), 0) == pdTRUE) {
+            incrementCounter(&recordsWritten);
+          } else {
+            incrementCounter(&ringBufferOverflowCount);
+          }
+        }
+        xSemaphoreGive(recordingStateMutex);
+      }
     }
 
     // Cortesia para loopTask/GPS/SD em um MCU single-core.
@@ -1701,11 +1745,35 @@ static void remusAppTickImpl() {
   // Cache the latest fix in RAM. NVS commits are intentionally kept out of an
   // active workout because flash compaction can block the single ESP32-C3 core
   // for hundreds of milliseconds and destroy IMU continuity.
-  if (remus::hardware.hasGps && isGpsFixValid() && gpsDevice.navigationSolutionUpdated()) {
-    fixCount++;
-    gpsSnapshotDirty = true;
-    if (!isWorkoutActive && millis() - lastGpsNvsPersist >= GPS_NVS_IDLE_INTERVAL_MS) {
-      persistLatestGpsFix();
+  if (remus::hardware.hasGps && gpsDevice.navigationSolutionUpdated()) {
+    const bool validFix = isGpsFixValid();
+    incrementCounter(&gpsEpochsReceived);
+    incrementCounter(validFix ? &gpsValidEpochs : &gpsInvalidEpochs);
+
+    const uint32_t currentItowMs = gpsDevice.gpsTimeOfWeekMs();
+    if (gpsDevice.enhancedNavigationAvailable() && previousGpsItowMs != UINT32_MAX) {
+      // iTOW rolls every GPS week. Unsigned modulo arithmetic handles the
+      // rollover as long as consecutive observations are less than one week apart.
+      constexpr uint32_t GPS_WEEK_MS = 604800000UL;
+      const uint32_t delta = currentItowMs >= previousGpsItowMs
+        ? currentItowMs - previousGpsItowMs
+        : GPS_WEEK_MS - previousGpsItowMs + currentItowMs;
+      if (delta > 201) {
+        incrementCounter(&gpsItowGapCount);
+        unsigned long observedMax = readCounter(&gpsMaxItowGapMs);
+        while (delta > observedMax && !__atomic_compare_exchange_n(
+            &gpsMaxItowGapMs, &observedMax, delta, false,
+            __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+      }
+    }
+    previousGpsItowMs = currentItowMs;
+
+    if (validFix) {
+      fixCount++;
+      gpsSnapshotDirty = true;
+      if (!isWorkoutActive && millis() - lastGpsNvsPersist >= GPS_NVS_IDLE_INTERVAL_MS) {
+        persistLatestGpsFix();
+      }
     }
 
     // O GPS usa o mesmo mutex da task do IMU, preservando registros inteiros e
@@ -1713,7 +1781,7 @@ static void remusAppTickImpl() {
     if (sdOk && isWorkoutActive && logFile && s_recordingRingBuf && recordingStateMutex) {
       RemusGpsV2Record gpsRec{};
       gpsRec.type = 0x04;
-      gpsRec.timestamp_ms = millis();
+      gpsRec.timestamp_ms = gpsDevice.navigationReceivedAtMs();
       gpsRec.gps_itow_ms = gpsDevice.gpsTimeOfWeekMs();
       gpsRec.lat_e7 = (int32_t)(gpsDevice.latitude() * 1e7);
       gpsRec.lon_e7 = (int32_t)(gpsDevice.longitude() * 1e7);
@@ -1727,7 +1795,7 @@ static void remusAppTickImpl() {
       gpsRec.sats_in_use = gpsDevice.satellitesInUse();
       gpsRec.max_snr = (uint8_t)gpsDevice.maxSnr();
       gpsRec.fix_type = gpsDevice.fixType();
-      gpsRec.flags = isGpsFixValid() ? 0x01 : 0x00;
+      gpsRec.flags = validFix ? 0x01 : 0x00;
 
       xSemaphoreTake(recordingStateMutex, portMAX_DELAY);
       if (isWorkoutActive) {
@@ -1868,6 +1936,11 @@ static void remusAppTickImpl() {
     Serial.printf("| BLE: [%s] ", bleConnected ? "CONECTADO" : "ANUNCIANDO");
     Serial.printf("| IMU gaps >%lums: %lu (max %lums) | Buf Overflow: %lu | I2C fail: %lu | SPM preview drops: %lu ",
       IMU_GAP_THRESHOLD_MS, gapSnapshot, maxIntervalSnapshot, overflowSnapshot, readFailureSnapshot, spmPreviewDropSnapshot);
+    if (isWorkoutActive) {
+      Serial.printf("| GPS epochs: %lu valid / %lu invalid (iTOW gaps: %lu, max %lums) ",
+        readCounter(&gpsValidEpochs), readCounter(&gpsInvalidEpochs),
+        readCounter(&gpsItowGapCount), readCounter(&gpsMaxItowGapMs));
+    }
     Serial.println();
   }
 }

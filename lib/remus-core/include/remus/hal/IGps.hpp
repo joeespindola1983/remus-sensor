@@ -20,6 +20,9 @@ public:
   virtual bool enhancedNavigationAvailable() const { return false; }
   virtual bool navigationSolutionUpdated() const { return locationUpdated(); }
   virtual uint32_t gpsTimeOfWeekMs() const { return 0; }
+  // ESP32 monotonic time captured when the complete receiver solution became
+  // available. This is receive time, not the physical GNSS measurement time.
+  virtual uint32_t navigationReceivedAtMs() const { return 0; }
   virtual uint32_t groundSpeedCmPerSecond() const {
     return static_cast<uint32_t>(speedKmph() * 27.7777778f);
   }

@@ -222,8 +222,11 @@ The reserved header padding is used to tag the producer without changing the RBP
 ESP32 firmware 0.3.x writes RBP2. The header remains 32 bytes, IMU (`0x01`) and
 SPM (`0x03`) stay byte-compatible, and GNSS uses `0x04` (41 bytes) with GPS
 time-of-week, Doppler ground speed, course, native horizontal/speed/course
-accuracy and fix status. Readers select the record layout from magic/version;
-they must not infer it from file size.
+accuracy and fix status. Every coherent GNSS epoch is retained, including epochs
+without a qualified fix (`flags = 0`), and its local timestamp is assigned when
+the complete receiver solution arrives. This preserves lock dropouts and makes
+iTOW cadence gaps measurable. Readers select the record layout from
+magic/version; they must not infer it from file size.
 
 ## Live SPM
 
@@ -232,5 +235,8 @@ they must not infer it from file size.
 ## BLE status
 
 Prototype 1 keeps the existing ESP32 BLE protocol and file-transfer implementation.
+`FILE_END` includes the byte count and a CRC32 of the exact RBP artifact. New
+clients validate unique byte coverage, RBP magic and CRC; the optional CRC field
+keeps older firmware and clients interoperable during migration.
 
 Prototype 2 currently implements capture, GPS, OLED, split, Linux storage and shared Live SPM. A BlueZ GATT transport has **not** been added yet. This separation is intentional: BlueZ belongs in `platforms/raspberrypi/`, not in the shared core. Until that driver is added, the Pi target is controlled by auto-start/systemd or its console commands.
