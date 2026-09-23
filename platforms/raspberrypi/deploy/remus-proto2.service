@@ -1,0 +1,16 @@
+[Unit]
+Description=REMUS Prototype 2 telemetry service
+After=local-fs.target
+
+[Service]
+Type=simple
+User=__REMUS_USER__
+Group=__REMUS_USER__
+WorkingDirectory=/opt/remus-sensor
+EnvironmentFile=-/etc/default/remus-sensor
+ExecStart=/opt/remus-sensor/remus-proto2 $REMUS_OPTS
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

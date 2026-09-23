@@ -1,0 +1,8 @@
+{
+  "name": "remus-core",
+  "version": "0.3.0",
+  "description": "Platform-independent REMUS telemetry core",
+  "build": {
+    "includeDir": "include"
+  }
+}

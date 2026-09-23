@@ -1,0 +1,18 @@
+[Unit]
+Description=REMUS Blade BLE GATT Service
+After=bluetooth.target remus-proto2.service
+Requires=bluetooth.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/remus-sensor
+ExecStartPre=-/usr/sbin/rfkill unblock bluetooth
+ExecStartPre=-/bin/hciconfig hci0 up
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -u /opt/remus-sensor/remus_ble_service.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

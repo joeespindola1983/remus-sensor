@@ -1,5 +1,9 @@
 .pio/
 .vscode/
-*.bin
-*.elf
 .DS_Store
+__pycache__/
+*.pyc
+platforms/raspberrypi/build/
+sessions/
+*.bin
+!platforms/esp32/partition_table_from_flash.bin
