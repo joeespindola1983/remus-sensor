@@ -219,7 +219,7 @@ Both targets understand the original RBP1 layout:
 
 The reserved header padding is used to tag the producer without changing the RBP1 size. Existing parsers that ignore padding remain compatible.
 
-ESP32 firmware 0.3 writes RBP2. The header remains 32 bytes, IMU (`0x01`) and
+ESP32 firmware 0.3.x writes RBP2. The header remains 32 bytes, IMU (`0x01`) and
 SPM (`0x03`) stay byte-compatible, and GNSS uses `0x04` (41 bytes) with GPS
 time-of-week, Doppler ground speed, course, native horizontal/speed/course
 accuracy and fix status. Readers select the record layout from magic/version;

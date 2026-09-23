@@ -14,7 +14,9 @@ struct DisplayTelemetry {
   bool gpsFix = false;
   bool gpsAccuracyEstimateAvailable = false;
   float strokeRateSpm = 0.0f;
-  float groundSpeedKmph = 0.0f;
+  float medianStrokeRateSpm = 0.0f;
+  uint16_t paceSecondsPer500m = 0;
+  uint16_t medianPaceSecondsPer500m = 0;
   float gpsAccuracyEstimateMeters = 0.0f;
   uint8_t satellitesInUse = 0;
   uint8_t satellitesInView = 0;
@@ -36,6 +38,10 @@ private:
   void drawField(int16_t x, int16_t y, int16_t width, int16_t height,
                  const char* value, uint16_t color, uint8_t textSize,
                  char* cache, size_t cacheSize, bool force);
+  void drawIndicatorField(int16_t x, int16_t y, int16_t width, int16_t height,
+                          const char* value, uint16_t indicatorColor,
+                          uint8_t textSize, char* cache, size_t cacheSize,
+                          bool force);
 
   Arduino_SWSPI bus_;
   Arduino_ST7789 tft_;
@@ -47,7 +53,9 @@ private:
   bool healthy_ = false;
   char statusCache_[16]{};
   char spmCache_[16]{};
-  char speedCache_[24]{};
+  char paceCache_[16]{};
+  char medianSpmCache_[16]{};
+  char medianPaceCache_[16]{};
   char gpsCache_[24]{};
   char healthCache_[40]{};
 };

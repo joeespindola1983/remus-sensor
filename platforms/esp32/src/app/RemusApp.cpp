@@ -35,7 +35,7 @@
 
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define REMUS_FIRMWARE_VERSION "0.3.0"
+#define REMUS_FIRMWARE_VERSION "0.3.1"
 
 // Binary session records live in remus-core and are shared with Prototype 2.
 using RemusFileHeader = remus::session::FileHeader;
@@ -58,6 +58,17 @@ remus::drivers::Gmt024Display displayDevice(
 
 remus::live::LiveSpmEstimator spmEstimator;
 float liveSpm = 0.0;
+
+// Display-only workout statistics. SPM uses half-stroke bins and pace uses
+// whole seconds per 500 m. Histograms give an exact running median with fixed
+// memory and no growing allocation during long sessions.
+constexpr uint16_t DISPLAY_MAX_SPM_X2 = 160;       // 80.0 SPM
+constexpr uint16_t DISPLAY_MAX_PACE_SECONDS = 1800; // 30:00 /500 m
+uint32_t displaySpmHistogram[DISPLAY_MAX_SPM_X2 + 1]{};
+uint32_t displayPaceHistogram[DISPLAY_MAX_PACE_SECONDS + 1]{};
+uint32_t displaySpmSamples = 0;
+uint32_t displayPaceSamples = 0;
+unsigned long lastDisplayStatisticsSampleMs = 0;
 
 Preferences prefs;
 File logFile;
@@ -397,6 +408,49 @@ void setupDisplay() {
   displayOk = displayDevice.begin();
 }
 
+uint16_t histogramMedian(const uint32_t* histogram, uint16_t maxValue,
+                         uint32_t sampleCount) {
+  if (sampleCount == 0) return 0;
+  const uint32_t target = (sampleCount + 1) / 2;
+  uint32_t cumulative = 0;
+  for (uint16_t value = 0; value <= maxValue; ++value) {
+    cumulative += histogram[value];
+    if (cumulative >= target) return value;
+  }
+  return 0;
+}
+
+void resetDisplayStatistics() {
+  memset(displaySpmHistogram, 0, sizeof(displaySpmHistogram));
+  memset(displayPaceHistogram, 0, sizeof(displayPaceHistogram));
+  displaySpmSamples = 0;
+  displayPaceSamples = 0;
+  lastDisplayStatisticsSampleMs = 0;
+}
+
+void sampleDisplayStatistics(float spm, bool gpsFix, float speedKmph) {
+  if (!isWorkoutActive) return;
+  const unsigned long now = millis();
+  if (lastDisplayStatisticsSampleMs != 0 &&
+      now - lastDisplayStatisticsSampleMs < 900) return;
+  lastDisplayStatisticsSampleMs = now;
+
+  if (spm > 0.0f) {
+    const uint16_t spmX2 = static_cast<uint16_t>(roundf(spm * 2.0f));
+    if (spmX2 <= DISPLAY_MAX_SPM_X2) {
+      ++displaySpmHistogram[spmX2];
+      ++displaySpmSamples;
+    }
+  }
+  if (gpsFix && speedKmph >= 1.0f) {
+    const uint16_t pace = static_cast<uint16_t>(roundf(1800.0f / speedKmph));
+    if (pace > 0 && pace <= DISPLAY_MAX_PACE_SECONDS) {
+      ++displayPaceHistogram[pace];
+      ++displayPaceSamples;
+    }
+  }
+}
+
 void updateDisplay(bool force) {
   if (!displayOk) return;
 
@@ -414,8 +468,17 @@ void updateDisplay(bool force) {
   telemetry.gpsFix = isGpsFixValid();
   telemetry.gpsAccuracyEstimateAvailable = telemetry.gpsFix &&
     (gpsDevice.enhancedNavigationAvailable() || gpsDevice.hdopValidRecent());
-  telemetry.strokeRateSpm = telemetrySpm;
-  telemetry.groundSpeedKmph = telemetry.gpsFix ? gpsDevice.speedKmph() : 0.0f;
+  const float speedKmph = telemetry.gpsFix ? gpsDevice.speedKmph() : 0.0f;
+  sampleDisplayStatistics(telemetrySpm, telemetry.gpsFix, speedKmph);
+  telemetry.strokeRateSpm = telemetrySpm > 0.0f
+    ? roundf(telemetrySpm * 2.0f) / 2.0f : 0.0f;
+  telemetry.medianStrokeRateSpm = displaySpmSamples > 0
+    ? histogramMedian(displaySpmHistogram, DISPLAY_MAX_SPM_X2, displaySpmSamples) / 2.0f
+    : 0.0f;
+  telemetry.paceSecondsPer500m = speedKmph >= 1.0f
+    ? static_cast<uint16_t>(roundf(1800.0f / speedKmph)) : 0;
+  telemetry.medianPaceSecondsPer500m = histogramMedian(
+    displayPaceHistogram, DISPLAY_MAX_PACE_SECONDS, displayPaceSamples);
   telemetry.gpsAccuracyEstimateMeters = !telemetry.gpsAccuracyEstimateAvailable ? 0.0f
     : gpsDevice.enhancedNavigationAvailable()
       ? gpsDevice.horizontalAccuracyMm() / 1000.0f
@@ -504,6 +567,7 @@ void startWorkoutRecording() {
   liveSpm = 0.0f;
   lastImuLoop = 0;
   portEXIT_CRITICAL(&telemetryMux);
+  resetDisplayStatistics();
   lastFlush = millis();
   isWorkoutActive = true;
   __atomic_store_n(&liveSpmPreviewEnabled, true, __ATOMIC_RELAXED);
