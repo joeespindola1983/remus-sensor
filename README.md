@@ -136,6 +136,16 @@ dispositivo errado:
 Use `--no-monitor` para apenas instalar ou `--monitor-only` para abrir somente
 o monitor serial. Pressione `Ctrl+C` para encerrar o monitor.
 
+No PlatformIO IDE, os mesmos fluxos aparecem em **Project Tasks**:
+
+- `remus-proto1 > Custom > Install & Monitor` instala o Remus Computer;
+- `remus-blade-dev > Custom > Install & Monitor` instala o Remus Blade.
+
+A tarefa compila, faz upload e abre o monitor a 115200 baud. As tarefas nativas
+`Upload` e `Monitor` continuam disponíveis separadamente. Quando houver várias
+portas, configure `upload_port` no ambiente correspondente ou use um dos scripts
+com `--port`.
+
 The development firmware samples raw MPU-6050 acceleration and gyroscope data
 at 200 Hz into a two-second queue. A lower-priority BLE task sends versioned,
 CRC-protected batches and fragments them when the negotiated MTU is smaller
