@@ -35,3 +35,6 @@ A Raspberry Pi Zero W is a Linux computer, not another ESP32 board definition. I
 ## Future Blade
 
 The future Blade target can be added under `platforms/esp32/` as another ESP32 hardware profile with IMU + BLE and no GPS/SD. `LiveSpmEstimator` remains untouched.
+
+The concrete build, protocol, identity, recorder and qualification sequence is
+defined in [BLADE_FIRMWARE_PLAN.md](BLADE_FIRMWARE_PLAN.md).

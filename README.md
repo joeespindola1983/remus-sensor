@@ -1,8 +1,9 @@
 # REMUS Sensor — multi-platform firmware
 
-This repository has one shared REMUS core and two hardware targets:
+This repository has one shared REMUS core and three hardware targets:
 
 - **Prototype 1 — ESP32-C3**: MPU-6050 + NEO-6M + MicroSD + TFT + BLE, built with PlatformIO.
+- **Remus Blade — ESP32-C3**: MPU-6050 + BLE live streaming, built with PlatformIO.
 - **Prototype 2 — Raspberry Pi Zero W v1.1**: MPU-6050 + NEO-6M + SSD1306 + Linux filesystem, built with CMake.
 
 The live SPM estimator and versioned RBP binary record definitions are shared. Platform code is isolated below `platforms/`.
@@ -22,8 +23,8 @@ remus-sensor/
 │   │   └── IStorage.hpp
 │   └── src/LiveSpmEstimator.cpp
 │
-├── platforms/esp32/                  # Prototype 1
-│   ├── include/remus/profiles/Prototype1.hpp
+├── platforms/esp32/                  # Prototype 1 and Remus Blade
+│   ├── include/remus/profiles/       # one explicit profile per hardware target
 │   ├── include/remus/drivers/
 │   └── src/
 │
@@ -87,6 +88,41 @@ pio device monitor -b 115200
 ```
 
 **Do not edit GPIOs in `main.cpp` or `RemusApp.cpp`.** Change the profile only.
+
+## Remus Blade — ESP32-C3 development profile
+
+The Blade is a separate firmware target in the same repository. It shares the
+versioned binary protocol and hardware abstractions with the full REMUS device,
+but it does not compile GPS, MicroSD, TFT or standalone recording features.
+
+| Component | Module pin | ESP32-C3 GPIO | Interface |
+|---|---|---:|---|
+| MPU-6050 / GY-521 | SCL | GPIO 5 | I2C clock |
+| MPU-6050 / GY-521 | SDA | GPIO 6 | I2C data |
+
+Build the full device and Blade independently:
+
+```bash
+pio run -e remus-proto1
+pio run -e remus-blade-dev
+```
+
+Upload only the Blade image:
+
+```bash
+pio run -e remus-blade-dev -t upload
+```
+
+The development firmware samples raw MPU-6050 acceleration and gyroscope data
+at 200 Hz into a two-second queue. A lower-priority BLE task sends versioned,
+CRC-protected batches and fragments them when the negotiated MTU is smaller
+than 185 bytes. Sampling never calls the BLE stack. Stable device serials are
+derived once from the ESP32 identity and persisted in NVS; the app can assign
+human aliases such as `Blade 01` without changing that identity.
+
+This beta intentionally makes no battery, onboard-storage, GNSS or
+store-and-forward claim. Those capabilities require matching hardware and
+evidence before they may be advertised.
 
 The TFT dashboard gives most of the screen to live SPM and GNSS speed. GPS is a
 sensor-status row: red without satellites, yellow with satellites but no fix,

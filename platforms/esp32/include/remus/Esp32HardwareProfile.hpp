@@ -4,7 +4,7 @@
 
 namespace remus::esp32::hw {
 
-enum class ProfileId : uint8_t { Prototype1 = 1 };
+enum class ProfileId : uint8_t { Prototype1 = 1, BladeDev = 2 };
 enum class ImuModel : uint8_t { Mpu6050 = 1 };
 enum class GpsModel : uint8_t { None = 0, Neo6m = 1 };
 enum class StorageModel : uint8_t { None = 0, MicroSdSpi = 1 };

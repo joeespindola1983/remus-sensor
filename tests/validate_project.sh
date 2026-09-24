@@ -18,6 +18,12 @@ c++ -std=c++17 -O2 \
   -o "$TMP/esp32_hardware_profile_smoke"
 "$TMP/esp32_hardware_profile_smoke"
 
+c++ -std=c++17 -O2 \
+  -I"$ROOT/lib/remus-core/include" \
+  "$ROOT/tests/blade_protocol_smoke.cpp" \
+  -o "$TMP/blade_protocol_smoke"
+"$TMP/blade_protocol_smoke"
+
 c++ -std=c++17 -O2 -pthread \
   -I"$ROOT/lib/remus-core/include" \
   -I"$ROOT/platforms/raspberrypi/include" \
