@@ -38,6 +38,9 @@ private:
   void drawField(int16_t x, int16_t y, int16_t width, int16_t height,
                  const char* value, uint16_t color, uint8_t textSize,
                  char* cache, size_t cacheSize, bool force);
+  void drawCenteredField(int16_t y, int16_t height, const char* value,
+                         uint16_t color, uint8_t textSize, char* cache,
+                         size_t cacheSize, bool force);
   void drawIndicatorField(int16_t x, int16_t y, int16_t width, int16_t height,
                           const char* value, uint16_t indicatorColor,
                           uint8_t textSize, char* cache, size_t cacheSize,
@@ -51,13 +54,9 @@ private:
   int rst_;
   int cs_;
   bool healthy_ = false;
-  char statusCache_[16]{};
   char spmCache_[16]{};
   char paceCache_[16]{};
-  char medianSpmCache_[16]{};
-  char medianPaceCache_[16]{};
-  char gpsCache_[24]{};
-  char healthCache_[40]{};
+  char healthCache_[64]{};
 };
 
 }  // namespace remus::drivers

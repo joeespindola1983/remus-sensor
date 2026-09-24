@@ -157,11 +157,13 @@ This beta intentionally makes no battery, onboard-storage, GNSS or
 store-and-forward claim. Those capabilities require matching hardware and
 evidence before they may be advertised.
 
-The TFT dashboard gives most of the screen to live SPM and GNSS speed. GPS is a
-sensor-status row: red without satellites, yellow with satellites but no fix,
-and light green with a fix. With the UBX profile active, horizontal error comes
-from the receiver; only the NMEA fallback uses an explicit HDOP-derived
-estimate. A second row shows IMU, MicroSD and BLE health.
+The TFT dashboard uses two full-width stacked metrics: live SPM above and
+pace/500 m below. Their values use nearly all available screen area for maximum
+readability while paddling. The bottom line combines workout state, IMU,
+MicroSD, BLE, compact GPS satellite state and written-record count. GPS uses a
+number for satellites in a qualified fix, `~N` while searching and `--` without
+signal. With the UBX profile active, horizontal error comes from the receiver;
+only the NMEA fallback uses an explicit HDOP-derived estimate.
 The dashboard uses partial 1 Hz updates so display rendering does not require a
 full-screen redraw during the 200 Hz acquisition path.
 
