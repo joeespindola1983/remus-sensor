@@ -81,6 +81,12 @@ Upload:
 pio run -e remus-proto1 -t upload
 ```
 
+Instalação seguida do monitor serial:
+
+```bash
+./scripts/install_remus_computer.sh
+```
+
 Monitor:
 
 ```bash
@@ -112,6 +118,23 @@ Upload only the Blade image:
 ```bash
 pio run -e remus-blade-dev -t upload
 ```
+
+Instalação seguida do monitor serial:
+
+```bash
+./scripts/install_remus_blade.sh
+```
+
+Os scripts selecionam automaticamente a porta quando há somente uma. Se mais
+de uma placa estiver conectada, escolha explicitamente para impedir upload no
+dispositivo errado:
+
+```bash
+./scripts/install_remus_blade.sh --port /dev/cu.usbmodem101
+```
+
+Use `--no-monitor` para apenas instalar ou `--monitor-only` para abrir somente
+o monitor serial. Pressione `Ctrl+C` para encerrar o monitor.
 
 The development firmware samples raw MPU-6050 acceleration and gyroscope data
 at 200 Hz into a two-second queue. A lower-priority BLE task sends versioned,
