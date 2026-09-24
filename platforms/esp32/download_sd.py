@@ -32,7 +32,7 @@ END_MAGIC = b"REND"
 
 def _port_candidates(preferred=None):
     ports = list(list_ports.comports())
-    devices = [p.device for p in ports]
+    devices = [p.device for p in ports if "Bluetooth" not in p.device and "BTH" not in p.device]
 
     ordered = []
     if preferred and preferred in devices:
@@ -68,9 +68,14 @@ def _initial_port():
     candidates = _port_candidates(configured if configured else None)
     if candidates:
         return candidates[0]
-    if configured and configured.lower() != "none":
+    
+    if configured and configured.lower() != "none" and "Bluetooth" not in configured and "BTH" not in configured:
         return configured
-    raise RuntimeError("Could not find the ESP32-C3 USB serial port.")
+        
+    raise RuntimeError(
+        "Could not find the ESP32 USB serial port. "
+        "Please ensure the Remus PC is plugged into the computer via a data-capable USB cable."
+    )
 
 
 def _open_serial(preferred_port=None, overall_timeout=15.0):

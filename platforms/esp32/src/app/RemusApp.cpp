@@ -35,7 +35,7 @@
 
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define REMUS_FIRMWARE_VERSION "0.3.2"
+#define REMUS_FIRMWARE_VERSION "1.0.0"
 
 // Binary session records live in remus-core and are shared with Prototype 2.
 using RemusFileHeader = remus::session::FileHeader;

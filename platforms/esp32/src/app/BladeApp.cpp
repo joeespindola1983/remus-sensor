@@ -24,7 +24,7 @@ namespace {
 
 namespace protocol = remus::blade::protocol;
 
-constexpr char kFirmwareVersion[] = "0.4.0-beta.1";
+constexpr char kFirmwareVersion[] = "1.0.0";
 constexpr char kServiceUuid[] = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 constexpr char kDeviceInfoUuid[] = "beb5483f-36e1-4688-b7f5-ea07361b26a8";
 constexpr char kControlUuid[] = "beb54840-36e1-4688-b7f5-ea07361b26a8";
@@ -124,13 +124,17 @@ void notifyControlAck(uint32_t requestId, protocol::ControlCommand command,
 
 class BladeServerCallbacks final : public BLEServerCallbacks {
  public:
-  void onConnect(BLEServer*) override { bleConnected = true; }
+  void onConnect(BLEServer*) override {
+    bleConnected = true;
+    Serial.println("[BLADE] 📲 BLE Client connected!");
+  }
 
   void onDisconnect(BLEServer* disconnectedServer) override {
     bleConnected = false;
     streamRequested = false;
     if (sampleQueue) xQueueReset(sampleQueue);
     disconnectedServer->startAdvertising();
+    Serial.println("[BLADE] 📴 BLE Client disconnected. Advertising...");
   }
 };
 
@@ -161,11 +165,13 @@ class ControlCallbacks final : public BLECharacteristicCallbacks {
         }
         if (sampleQueue) xQueueReset(sampleQueue);
         streamRequested = true;
+        Serial.println("[BLADE] ▶️ IMU 200 Hz stream started");
         notifyControlAck(requestId, command, protocol::ControlStatus::Accepted);
         return;
       case protocol::ControlCommand::StopStream:
         streamRequested = false;
         if (sampleQueue) xQueueReset(sampleQueue);
+        Serial.println("[BLADE] ⏹️ IMU stream stopped");
         notifyControlAck(requestId, command, protocol::ControlStatus::Accepted);
         return;
       default:
@@ -369,8 +375,17 @@ void publishStatus() {
 }  // namespace
 
 void remus::app::BladeApp::begin() {
+  Serial.setTxBufferSize(4096);
+  Serial.setRxBufferSize(1024);
   Serial.begin(115200);
-  delay(150);
+  Serial.setTxTimeoutMs(0);
+  delay(800);
+
+  Serial.println("\n=========================================================");
+  Serial.println("         REMUS BLADE — SENSOR DE PÁ / IMU BLE            ");
+  Serial.printf("         Firmware %s | Protocol Major %u\n", kFirmwareVersion, protocol::kVersion);
+  Serial.println("=========================================================");
+
   buildIdentity();
   sampleQueue = xQueueCreate(kSampleQueueLength, sizeof(protocol::RawImuFrame));
   imuHealthy = sampleQueue && imuDevice.begin();
@@ -384,15 +399,45 @@ void remus::app::BladeApp::begin() {
                 deviceName, deviceSerial.c_str(), remus::hardware.imuPins.sda,
                 remus::hardware.imuPins.scl, imuHealthy ? "OK" : "ERROR",
                 kFirmwareVersion);
+  Serial.println("=========================================================\n");
+  Serial.flush();
 }
 
 void remus::app::BladeApp::tick() {
   static uint32_t lastStatusMs = 0;
+  static uint32_t lastSerialHeartbeatMs = 0;
   const uint32_t now = millis();
+
+  // If user presses Enter or sends characters via Serial, reply with device info
+  if (Serial.available()) {
+    while (Serial.available()) Serial.read();
+    Serial.printf("[BLADE] %s serial=%s SDA=%d SCL=%d IMU=%s BLE=%s samples=%lu drops=%lu firmware=%s\n",
+                  deviceName, deviceSerial.c_str(), remus::hardware.imuPins.sda,
+                  remus::hardware.imuPins.scl, imuHealthy ? "OK" : "ERROR",
+                  bleConnected ? (streamRequested ? "STREAMING" : "CONNECTED") : "ADVERTISING",
+                  static_cast<unsigned long>(atomicRead(&nextSampleSequence)),
+                  static_cast<unsigned long>(atomicRead(&queueDropCount)),
+                  kFirmwareVersion);
+    Serial.flush();
+  }
+
   if (now - lastStatusMs >= 1000) {
     lastStatusMs = now;
     if (!imuHealthy && !streamRequested) imuHealthy = imuDevice.begin();
     publishStatus();
   }
+
+  // Periodic heartbeat so monitor is never silent
+  if (now - lastSerialHeartbeatMs >= 3000) {
+    lastSerialHeartbeatMs = now;
+    Serial.printf("[BLADE] %s | IMU=%s | BLE=%s | samples=%lu | drops=%lu\n",
+                  deviceName,
+                  imuHealthy ? "OK" : "ERROR",
+                  bleConnected ? (streamRequested ? "STREAMING" : "CONNECTED") : "ADV",
+                  static_cast<unsigned long>(atomicRead(&nextSampleSequence)),
+                  static_cast<unsigned long>(atomicRead(&queueDropCount)));
+    Serial.flush();
+  }
+
   delay(5);
 }

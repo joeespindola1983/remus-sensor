@@ -64,9 +64,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 if ! command -v pio >/dev/null 2>&1; then
-  echo "Erro: PlatformIO CLI (pio) não foi encontrado no PATH." >&2
-  echo "Instale o PlatformIO Core ou execute pelo terminal integrado do PlatformIO." >&2
-  exit 1
+  if [[ -x "${HOME}/.platformio/penv/bin/pio" ]]; then
+    export PATH="${HOME}/.platformio/penv/bin:${PATH}"
+  elif command -v platformio >/dev/null 2>&1; then
+    pio() { platformio "$@"; }
+  else
+    echo "Erro: PlatformIO CLI (pio) não foi encontrado no PATH." >&2
+    echo "Instale o PlatformIO Core ou execute pelo terminal integrado do PlatformIO." >&2
+    exit 1
+  fi
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -112,5 +118,15 @@ fi
 
 if [[ "$monitor" == true ]]; then
   echo "Abrindo monitor serial a 115200 baud. Pressione Ctrl+C para sair."
-  exec pio device monitor --port "$port" --baud 115200
+  monitor_cmd=(pio device monitor -e "$environment" --port "$port" --baud 115200 --rts 0 --dtr 1)
+  if [[ -t 0 ]]; then
+    exec "${monitor_cmd[@]}"
+  elif [[ -r /dev/tty ]]; then
+    exec "${monitor_cmd[@]}" < /dev/tty
+  else
+    echo "Aviso: Terminal interativo não detectado (stdin não é TTY)."
+    echo "Para abrir o monitor manualmente, execute:"
+    echo "  pio device monitor -e '$environment' --port '$port' --baud 115200 --rts 0 --dtr 1"
+    exit 0
+  fi
 fi

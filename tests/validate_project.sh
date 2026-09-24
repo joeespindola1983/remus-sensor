@@ -40,4 +40,6 @@ else
   echo "[VALIDATE] Note: Skipping Linux-specific remus-proto2 binary build on non-Linux host ($(uname -s))."
 fi
 
+python3 "$ROOT/tests/test_platformio_custom_targets.py"
+
 echo "REMUS validation OK"
