@@ -18,6 +18,10 @@ inline constexpr size_t kMaxSamplesPerBatch = 10;
 inline constexpr size_t kMaxBatchSize =
     kBatchHeaderSize + (kBytesPerSample * kMaxSamplesPerBatch) + kBatchCrcSize;
 inline constexpr size_t kFragmentHeaderSize = 9;
+inline constexpr size_t kRelayHeaderSize = 12;
+inline constexpr size_t kRelayCrcSize = 4;
+inline constexpr size_t kMaxRelayedPacketSize =
+    kRelayHeaderSize + kMaxBatchSize + kRelayCrcSize;
 
 enum class MessageType : uint8_t {
   ImuBatch = 0x01,
@@ -25,6 +29,7 @@ enum class MessageType : uint8_t {
   ControlAck = 0x03,
   ClockSyncResponse = 0x04,
   Fragment = 0x11,
+  RelayedPacket = 0x21,
 };
 
 enum class ControlCommand : uint8_t {
@@ -69,6 +74,17 @@ inline uint32_t readU32(const uint8_t* in) {
          (static_cast<uint32_t>(in[1]) << 8) |
          (static_cast<uint32_t>(in[2]) << 16) |
          (static_cast<uint32_t>(in[3]) << 24);
+}
+
+inline uint64_t readU64(const uint8_t* in) {
+  uint64_t value = 0;
+  for (size_t i = 0; i < 8; ++i) value |= static_cast<uint64_t>(in[i]) << (i * 8);
+  return value;
+}
+
+inline uint16_t readU16(const uint8_t* in) {
+  return static_cast<uint16_t>(in[0]) |
+         (static_cast<uint16_t>(in[1]) << 8);
 }
 
 inline uint32_t crc32(const uint8_t* data, size_t length) {
@@ -136,6 +152,25 @@ inline size_t encodeFragment(uint8_t* out, size_t capacity,
   out[8] = static_cast<uint8_t>(payloadLength);
   for (size_t i = 0; i < payloadLength; ++i) out[kFragmentHeaderSize + i] = payload[i];
   return kFragmentHeaderSize + payloadLength;
+}
+
+inline size_t encodeRelayedPacket(uint8_t* out, size_t capacity,
+                                 uint32_t sourceIdentityHash,
+                                 uint32_t computerReceivedAtMs,
+                                 const uint8_t* payload,
+                                 size_t payloadLength) {
+  if (!out || !payload || payloadLength == 0 || payloadLength > kMaxBatchSize) return 0;
+  const size_t required = kRelayHeaderSize + payloadLength + kRelayCrcSize;
+  if (capacity < required) return 0;
+  out[0] = kVersion;
+  out[1] = static_cast<uint8_t>(MessageType::RelayedPacket);
+  writeU32(out + 2, sourceIdentityHash);
+  writeU32(out + 6, computerReceivedAtMs);
+  writeU16(out + 10, static_cast<uint16_t>(payloadLength));
+  for (size_t i = 0; i < payloadLength; ++i) out[kRelayHeaderSize + i] = payload[i];
+  writeU32(out + kRelayHeaderSize + payloadLength,
+           crc32(out, kRelayHeaderSize + payloadLength));
+  return required;
 }
 
 }  // namespace remus::blade::protocol

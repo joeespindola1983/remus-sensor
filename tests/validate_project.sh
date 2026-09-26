@@ -24,6 +24,33 @@ c++ -std=c++17 -O2 \
   -o "$TMP/blade_protocol_smoke"
 "$TMP/blade_protocol_smoke"
 
+c++ -std=c++17 -O2 \
+  -I"$ROOT/lib/remus-core/include" \
+  "$ROOT/tests/blade_relay_format_smoke.cpp" \
+  -o "$TMP/blade_relay_format_smoke"
+"$TMP/blade_relay_format_smoke"
+
+c++ -std=c++17 -O2 \
+  -I"$ROOT/lib/remus-core/include" \
+  "$ROOT/tests/blade_orientation_smoke.cpp" \
+  "$ROOT/lib/remus-core/src/BladeOrientation.cpp" \
+  -o "$TMP/blade_orientation_smoke"
+"$TMP/blade_orientation_smoke"
+
+c++ -std=c++17 -O2 \
+  -I"$ROOT/lib/remus-core/include" \
+  "$ROOT/tests/dual_blade_orientation_smoke.cpp" \
+  "$ROOT/lib/remus-core/src/BladeOrientation.cpp" \
+  "$ROOT/lib/remus-core/src/DualBladeOrientation.cpp" \
+  -o "$TMP/dual_blade_orientation_smoke"
+"$TMP/dual_blade_orientation_smoke"
+
+c++ -std=c++17 -O2 \
+  -I"$ROOT/lib/remus-core/include" \
+  "$ROOT/tests/blade_slot_registry_smoke.cpp" \
+  -o "$TMP/blade_slot_registry_smoke"
+"$TMP/blade_slot_registry_smoke"
+
 c++ -std=c++17 -O2 -pthread \
   -I"$ROOT/lib/remus-core/include" \
   -I"$ROOT/platforms/raspberrypi/include" \

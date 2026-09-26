@@ -138,6 +138,17 @@ void Gmt024Display::drawCenteredField(int16_t y, int16_t height,
 void Gmt024Display::render(const DisplayTelemetry& telemetry, bool force) {
   if (!healthy_) return;
 
+  if (telemetry.bladeAlignmentAvailable) {
+    drawBladeAlignment(telemetry, force);
+    return;
+  }
+  if (alignmentMode_) {
+    alignmentMode_ = false;
+    alignmentDegreesCache_ = 1000.0f;
+    drawStaticLayout();
+    force = true;
+  }
+
   const char* status = telemetry.transferring ? "XFR" :
                        telemetry.recording ? "GRAV" : "PRONTO";
   const uint16_t statusColor = telemetry.transferring ? kWarning :
@@ -170,6 +181,44 @@ void Gmt024Display::render(const DisplayTelemetry& telemetry, bool force) {
            telemetry.recordsWritten);
   drawIndicatorField(4, 220, 312, 12, value, statusColor, 1,
                      healthCache_, sizeof(healthCache_), force);
+}
+
+void Gmt024Display::drawBladeAlignment(const DisplayTelemetry& telemetry, bool force) {
+  const float delta = telemetry.relativeEquipmentAlignmentDegrees;
+  if (!force && alignmentMode_ && std::abs(delta - alignmentDegreesCache_) < 0.5f) return;
+  alignmentMode_ = true;
+  alignmentDegreesCache_ = delta;
+  tft_.fillScreen(kBackground);
+
+  tft_.setTextColor(kMuted);
+  tft_.setTextSize(2);
+  tft_.setCursor(45, 8);
+  tft_.print("ALINHAMENTO DAS PAS");
+
+  const float halfRadians = delta * 0.5f * 3.14159265358979323846f / 180.0f;
+  constexpr int16_t centerX = 160;
+  constexpr int16_t centerY = 140;
+  constexpr int16_t bladeLength = 112;
+  const int16_t horizontal = static_cast<int16_t>(std::cos(halfRadians) * bladeLength);
+  const int16_t vertical = static_cast<int16_t>(std::sin(halfRadians) * bladeLength);
+  tft_.drawLine(centerX, centerY, centerX - horizontal, centerY - vertical, kBlue);
+  tft_.drawLine(centerX, centerY + 1, centerX - horizontal, centerY - vertical + 1, kBlue);
+  tft_.drawLine(centerX, centerY, centerX + horizontal, centerY - vertical, kGreen);
+  tft_.drawLine(centerX, centerY + 1, centerX + horizontal, centerY - vertical + 1, kGreen);
+  tft_.fillCircle(centerX, centerY, 5, kText);
+
+  char value[32];
+  snprintf(value, sizeof(value), "DIF %.1f graus", delta);
+  tft_.setTextColor(telemetry.orientationQuality >= 3 ? kOk : kWarning);
+  tft_.setTextSize(2);
+  const int16_t textWidth = static_cast<int16_t>(strlen(value)) * 12;
+  tft_.setCursor(std::max<int16_t>(4, (320 - textWidth) / 2), 195);
+  tft_.print(value);
+  tft_.setTextSize(1);
+  tft_.setCursor(6, 226);
+  tft_.print(telemetry.orientationQuality >= 3
+      ? "RELATIVO CALIBRADO"
+      : "QUALIDADE DEGRADADA");
 }
 
 }  // namespace remus::drivers

@@ -15,6 +15,9 @@
 #include <SD.h>
 #include <Preferences.h>
 #include <BLEDevice.h>
+#include <BLEClient.h>
+#include <BLEScan.h>
+#include <BLERemoteCharacteristic.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
@@ -24,8 +27,18 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 
+#include <algorithm>
+#include <array>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+
 #include "remus/ActiveProfile.hpp"
 #include "remus/app/RemusApp.hpp"
+#include "remus/core/BladeProtocol.hpp"
+#include "remus/core/BladeRelayFormat.hpp"
+#include "remus/core/BladeSlotRegistry.hpp"
+#include "remus/core/DualBladeOrientation.hpp"
 #include "remus/core/LiveSpmEstimator.hpp"
 #include "remus/core/SessionFormat.hpp"
 #include "remus/drivers/Gmt024Display.hpp"
@@ -35,7 +48,11 @@
 
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define REMUS_FIRMWARE_VERSION "1.0.0"
+#define IMU_STREAM_CHARACTERISTIC_UUID "beb54841-36e1-4688-b7f5-ea07361b26a8"
+#define BLADE_CONTROL_CHARACTERISTIC_UUID "beb54840-36e1-4688-b7f5-ea07361b26a8"
+#define BLADE_RELAY_CHARACTERISTIC_UUID "beb54844-36e1-4688-b7f5-ea07361b26a8"
+#define BLADE_CLOCK_SYNC_CHARACTERISTIC_UUID "beb54843-36e1-4688-b7f5-ea07361b26a8"
+#define REMUS_FIRMWARE_VERSION "1.3.0"
 
 // Binary session records live in remus-core and are shared with Prototype 2.
 using RemusFileHeader = remus::session::FileHeader;
@@ -73,10 +90,14 @@ unsigned long lastDisplayStatisticsSampleMs = 0;
 Preferences prefs;
 File logFile;
 File transferFile;
+File bladeRelayFiles[2];
 
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
+BLECharacteristic* pImuStreamCharacteristic = NULL;
+BLECharacteristic* pBladeRelayCharacteristic = NULL;
 volatile bool bleConnected = false;
+volatile bool bladeRosterDirty = true;
 bool oldBleConnected = false;
 char remusDeviceName[24] = "REMUS-ESP32";
 
@@ -98,8 +119,18 @@ volatile unsigned long lastImuLoop = 0;
 unsigned long lastSerialPrint = 0;
 unsigned long lastFlush = 0;
 int fixCount = 0;
-volatile unsigned long recordsWritten = 0;
+// Acquisition and durable persistence are deliberately separate facts.
+// recordsQueued is incremented only after a complete record enters the RAM
+// buffer. recordsPersisted is incremented only after all bytes of that record
+// have been accepted by the MicroSD File implementation.
+volatile unsigned long recordsQueued = 0;
+volatile unsigned long recordsPersisted = 0;
+volatile unsigned long bytesPersisted = 0;
+volatile unsigned long storageWriteFailureCount = 0;
+volatile bool recordingStorageFault = false;
 volatile bool isWorkoutActive = false;
+volatile bool bladeCalibrationRequested = false;
+volatile unsigned long bladeCalibrationRequestedAtMs = 0;
 volatile unsigned long imuGapCount = 0;
 volatile unsigned long maxImuGapMs = 0;
 volatile unsigned long imuReadFailureCount = 0;
@@ -146,6 +177,9 @@ constexpr unsigned long USB_RECOVERY_ACK_TIMEOUT_MS = 10000;
 // Nome único do arquivo de sessão no SD (ex: /remus_sensor_A1B2C3D4.bin)
 char currentSessionFileName[64] = "/remus_session.bin";
 char currentTransferFileName[64] = "";
+char currentBladeRelayFileNames[2][64]{};
+uint32_t currentSessionId = 0;
+uint32_t currentSessionStartedAtMs = 0;
 
 // Fila circular em RAM (16 KB = ~4,8s de IMU a 200 Hz). Ela absorve a
 // latência normal do MicroSD sem alterar o contrato binário RBP1.
@@ -156,6 +190,76 @@ volatile unsigned long ringBufferOverflowCount = 0;
 TaskHandle_t imuTaskHandle = NULL;
 volatile bool isConfiguringMpu = false;
 SemaphoreHandle_t recordingStateMutex = NULL;
+size_t persistedRecordBytesRemaining = 0;
+
+// The live app copy is an independent sink. Radio pressure may create an
+// explicit sequence gap, but it must never block the acquisition task or the
+// durable MicroSD path.
+QueueHandle_t pcLiveImuQueue = NULL;
+TaskHandle_t pcLiveImuTaskHandle = NULL;
+constexpr UBaseType_t PC_LIVE_IMU_QUEUE_LENGTH = 400;  // Two seconds at 200 Hz.
+volatile uint32_t pcLiveSampleSequence = 0;
+volatile uint32_t pcLiveBatchSequence = 0;
+volatile unsigned long pcLiveQueueDropCount = 0;
+
+// The Computer is the primary BLE central for up to two Blades. The slot is a
+// user-declared role and is never inferred from discovery order. Original Blade
+// notifications share one tagged queue but keep independent clients, clocks,
+// counters and source-specific RBR1 sidecars.
+struct BladeRelayPacket {
+  uint8_t channelIndex;
+  uint32_t sourceIdentityHash;
+  uint32_t receivedAtMs;
+  uint16_t length;
+  uint8_t payload[remus::blade::relay::kMaxPacketSize];
+};
+QueueHandle_t bladeRelayQueue = NULL;
+TaskHandle_t bladeRelayClientTaskHandle = NULL;
+constexpr UBaseType_t BLADE_RELAY_QUEUE_LENGTH = 32;
+constexpr size_t BLADE_CHANNEL_COUNT = 2;
+struct BladeChannel {
+  BLEClient* client = NULL;
+  BLERemoteCharacteristic* controlCharacteristic = NULL;
+  BLERemoteCharacteristic* streamCharacteristic = NULL;
+  BLERemoteCharacteristic* clockSyncCharacteristic = NULL;
+  volatile bool connected = false;
+  volatile bool streamCommanded = false;
+  bool provisionallyDiscovered = false;
+  uint8_t sourceAddress[6]{};
+  uint32_t sourceIdentityHash = 0;
+  uint32_t controlRequestId = 0;
+  uint32_t clockSyncRequestId = 0;
+  unsigned long lastClockSyncMs = 0;
+  volatile unsigned long notificationsReceived = 0;
+  volatile unsigned long packetsPersisted = 0;
+  volatile unsigned long bytesPersisted = 0;
+  volatile unsigned long queueDropCount = 0;
+  volatile unsigned long writeFailureCount = 0;
+  volatile unsigned long liveDropCount = 0;
+  volatile bool storageFault = false;
+  volatile uint32_t liveSequence = 0;
+  remus::orientation::ClockMapping clockMapping{};
+};
+BladeChannel bladeChannels[BLADE_CHANNEL_COUNT]{};
+remus::blade::SlotRegistry bladeSlotRegistry;
+remus::orientation::DualBladeOrientation dualBladeOrientation;
+portMUX_TYPE bladeClockMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE bladeSlotMux = portMUX_INITIALIZER_UNLOCKED;
+SemaphoreHandle_t bladeOrientationMutex = NULL;
+
+remus::blade::SlotAssignment bladeAssignment(remus::blade::Slot slot) {
+  portENTER_CRITICAL(&bladeSlotMux);
+  const auto assignment = bladeSlotRegistry.get(slot);
+  portEXIT_CRITICAL(&bladeSlotMux);
+  return assignment;
+}
+
+uint32_t bladeSlotRevision() {
+  portENTER_CRITICAL(&bladeSlotMux);
+  const uint32_t revision = bladeSlotRegistry.revision();
+  portEXIT_CRITICAL(&bladeSlotMux);
+  return revision;
+}
 
 // Live SPM is only a low-priority preview for the app. The 200 Hz IMU task
 // never runs the estimator. It only contributes a cheap 8-sample average
@@ -198,6 +302,13 @@ void startFileTransfer(const String& targetFile = "");
 void processFileTransfer();
 void imuSamplingTask(void* pvParameters);
 void liveSpmProcessingTask(void* pvParameters);
+void pcLiveImuStreamingTask(void* pvParameters);
+void bladeRelayClientTask(void* pvParameters);
+void processBladeRelayStorage(size_t maxRecords = 8);
+void closeBladeRelayFile();
+void notifyBladeRelayPacket(const BladeRelayPacket& packet);
+void notifyBladeRoster(bool force = false);
+void notifyBladeSlotState(const char* status);
 void processControlCommands();
 void setupIMU();
 void setupSD();
@@ -224,6 +335,234 @@ void updateMaximum(volatile unsigned long* target, unsigned long candidate) {
   while (candidate > current &&
          !__atomic_compare_exchange_n(target, &current, candidate, false,
                                       __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+}
+
+size_t recordingRecordSize(uint8_t type) {
+  switch (type) {
+    case 0x01: return sizeof(RemusImuRecord);
+    case 0x03: return sizeof(RemusSpmRecord);
+    case 0x04: return sizeof(RemusGpsV2Record);
+    default: return 0;
+  }
+}
+
+bool accountPersistedRecordBytes(const uint8_t* data, size_t length) {
+  size_t offset = 0;
+  while (offset < length) {
+    if (persistedRecordBytesRemaining == 0) {
+      persistedRecordBytesRemaining = recordingRecordSize(data[offset]);
+      if (persistedRecordBytesRemaining == 0) return false;
+    }
+    const size_t available = length - offset;
+    const size_t consumed = std::min(available, persistedRecordBytesRemaining);
+    offset += consumed;
+    persistedRecordBytesRemaining -= consumed;
+    if (persistedRecordBytesRemaining == 0) incrementCounter(&recordsPersisted);
+  }
+  return true;
+}
+
+bool writeRecordingBytes(const uint8_t* data, size_t length) {
+  size_t offset = 0;
+  while (offset < length) {
+    const size_t accepted = logFile.write(data + offset, length - offset);
+    if (accepted == 0 || accepted > length - offset) {
+      incrementCounter(&storageWriteFailureCount);
+      __atomic_store_n(&recordingStorageFault, true, __ATOMIC_RELAXED);
+      return false;
+    }
+    if (!accountPersistedRecordBytes(data + offset, accepted)) {
+      incrementCounter(&storageWriteFailureCount);
+      __atomic_store_n(&recordingStorageFault, true, __ATOMIC_RELAXED);
+      return false;
+    }
+    incrementCounter(&bytesPersisted, accepted);
+    offset += accepted;
+  }
+  return true;
+}
+
+void abortRecordingAfterStorageFailure(size_t attemptedBytes) {
+  if (logFile) {
+    logFile.flush();
+    logFile.close();
+  }
+  sdOk = false;
+  updateDisplay(true);
+  Serial.printf(
+    "[SD] ❌ FALHA DE PERSISTÊNCIA LOCAL após %lu bytes/%lu registros duráveis; bloco=%u bytes; falhas=%lu. Stream ao app continua ativo.\n",
+    readCounter(&bytesPersisted), readCounter(&recordsPersisted),
+    static_cast<unsigned int>(attemptedBytes), readCounter(&storageWriteFailureCount));
+}
+
+bool writeBladeRelayBytes(size_t channelIndex, const uint8_t* data, size_t length) {
+  if (channelIndex >= BLADE_CHANNEL_COUNT) return false;
+  BladeChannel& channel = bladeChannels[channelIndex];
+  size_t offset = 0;
+  while (offset < length) {
+    const size_t accepted = bladeRelayFiles[channelIndex].write(data + offset, length - offset);
+    if (accepted == 0 || accepted > length - offset) {
+      incrementCounter(&channel.writeFailureCount);
+      __atomic_store_n(&channel.storageFault, true, __ATOMIC_RELAXED);
+      return false;
+    }
+    incrementCounter(&channel.bytesPersisted, accepted);
+    offset += accepted;
+  }
+  return true;
+}
+
+bool openBladeRelayFileIfNeeded(size_t channelIndex) {
+  if (channelIndex >= BLADE_CHANNEL_COUNT) return false;
+  BladeChannel& channel = bladeChannels[channelIndex];
+  if (bladeRelayFiles[channelIndex]) return true;
+  if (!sdOk || currentSessionId == 0 ||
+      channel.sourceIdentityHash == 0 ||
+      __atomic_load_n(&channel.storageFault, __ATOMIC_RELAXED)) return false;
+  bladeRelayFiles[channelIndex] = SD.open(currentBladeRelayFileNames[channelIndex], FILE_WRITE);
+  if (!bladeRelayFiles[channelIndex]) {
+    incrementCounter(&channel.writeFailureCount);
+    __atomic_store_n(&channel.storageFault, true, __ATOMIC_RELAXED);
+    Serial.printf("[BLADE RELAY] ❌ Não foi possível criar %s.\n",
+                  currentBladeRelayFileNames[channelIndex]);
+    return false;
+  }
+  const auto header = remus::blade::relay::makeHeader(
+    currentSessionStartedAtMs, currentSessionId, channel.sourceAddress,
+    channel.sourceIdentityHash);
+  if (!writeBladeRelayBytes(channelIndex, reinterpret_cast<const uint8_t*>(&header), sizeof(header))) {
+    bladeRelayFiles[channelIndex].close();
+    return false;
+  }
+  bladeRelayFiles[channelIndex].flush();
+  Serial.printf("[BLADE RELAY] 🔴 Backup do Blade iniciado: %s (source=%08lX).\n",
+    currentBladeRelayFileNames[channelIndex],
+    static_cast<unsigned long>(channel.sourceIdentityHash));
+  return true;
+}
+
+void processBladeOrientation(const BladeRelayPacket& packet) {
+  namespace protocol = remus::blade::protocol;
+  if (packet.channelIndex >= BLADE_CHANNEL_COUNT ||
+      packet.length < protocol::kBatchHeaderSize + protocol::kBatchCrcSize ||
+      packet.payload[0] != protocol::kVersion ||
+      packet.payload[1] != static_cast<uint8_t>(protocol::MessageType::ImuBatch)) return;
+  const uint8_t sampleCount = packet.payload[22];
+  const size_t required = protocol::kBatchHeaderSize +
+    static_cast<size_t>(sampleCount) * protocol::kBytesPerSample + protocol::kBatchCrcSize;
+  if (sampleCount == 0 || sampleCount > protocol::kMaxSamplesPerBatch ||
+      required != packet.length ||
+      protocol::readU32(packet.payload + required - protocol::kBatchCrcSize) !=
+        protocol::crc32(packet.payload, required - protocol::kBatchCrcSize)) return;
+
+  const remus::blade::Slot slot = packet.channelIndex == 0
+    ? remus::blade::Slot::Left : remus::blade::Slot::Right;
+  const auto assignment = bladeAssignment(slot);
+  if (!assignment.configured || assignment.sourceIdentityHash != packet.sourceIdentityHash) return;
+  if (!bladeOrientationMutex ||
+      xSemaphoreTake(bladeOrientationMutex, pdMS_TO_TICKS(5)) != pdTRUE) return;
+  const auto side = packet.channelIndex == 0
+    ? remus::orientation::BladeSide::Left : remus::orientation::BladeSide::Right;
+  remus::orientation::ClockMapping clockMapping{};
+  portENTER_CRITICAL(&bladeClockMux);
+  clockMapping = bladeChannels[packet.channelIndex].clockMapping;
+  portEXIT_CRITICAL(&bladeClockMux);
+  dualBladeOrientation.updateClockMapping(side, clockMapping);
+  const uint64_t baseTimestampUs = protocol::readU64(packet.payload + 12);
+  const uint16_t samplePeriodUs = protocol::readU16(packet.payload + 20);
+  size_t offset = protocol::kBatchHeaderSize;
+  constexpr float kDegreesToRadians = 0.01745329251994329577f;
+  for (uint8_t index = 0; index < sampleCount; ++index) {
+    auto readI16 = [&](size_t at) {
+      return static_cast<int16_t>(protocol::readU16(packet.payload + at));
+    };
+    remus::orientation::Sample sample{};
+    sample.accelerationG = {
+      readI16(offset) / 4096.0f,
+      readI16(offset + 2) / 4096.0f,
+      readI16(offset + 4) / 4096.0f,
+    };
+    sample.rotationRateRadiansPerSecond = {
+      readI16(offset + 6) / 65.5f * kDegreesToRadians,
+      readI16(offset + 8) / 65.5f * kDegreesToRadians,
+      readI16(offset + 10) / 65.5f * kDegreesToRadians,
+    };
+    const int16_t jitterUs = readI16(offset + 12);
+    const int64_t timestampUs = static_cast<int64_t>(baseTimestampUs) +
+      static_cast<int64_t>(index) * samplePeriodUs + jitterUs;
+    if (timestampUs <= 0) {
+      offset += protocol::kBytesPerSample;
+      continue;
+    }
+    sample.nativeTimestampUs = static_cast<uint64_t>(timestampUs);
+    dualBladeOrientation.push(side, packet.sourceIdentityHash, sample);
+    offset += protocol::kBytesPerSample;
+  }
+  if (__atomic_load_n(&bladeCalibrationRequested, __ATOMIC_RELAXED)) {
+    const auto snapshot = dualBladeOrientation.snapshot();
+    const bool leftReady = snapshot.left.orientation.orientationQuality >=
+      remus::orientation::Quality::Degraded;
+    const bool rightReady = snapshot.right.orientation.orientationQuality >=
+      remus::orientation::Quality::Degraded;
+    if (leftReady && rightReady &&
+        dualBladeOrientation.calibrate(remus::orientation::BladeSide::Left) &&
+        dualBladeOrientation.calibrate(remus::orientation::BladeSide::Right)) {
+      __atomic_store_n(&bladeCalibrationRequested, false, __ATOMIC_RELAXED);
+      notifyBladeSlotState("CALIBRATED");
+    }
+  }
+  xSemaphoreGive(bladeOrientationMutex);
+}
+
+void processBladeRelayStorage(size_t maxRecords) {
+  if (!bladeRelayQueue) return;
+  std::array<uint8_t,
+    sizeof(remus::blade::relay::PacketRecordHeader) +
+    remus::blade::relay::kMaxPacketSize +
+    remus::blade::relay::kRecordCrcSize> encoded{};
+  BladeRelayPacket packet{};
+  for (size_t index = 0; index < maxRecords; ++index) {
+    if (xQueueReceive(bladeRelayQueue, &packet, 0) != pdTRUE) break;
+    processBladeOrientation(packet);
+    if (!isWorkoutActive) continue;
+    notifyBladeRelayPacket(packet);
+    if (packet.channelIndex >= BLADE_CHANNEL_COUNT) continue;
+    BladeChannel& channel = bladeChannels[packet.channelIndex];
+    if (__atomic_load_n(&channel.storageFault, __ATOMIC_RELAXED)) continue;
+    if (!openBladeRelayFileIfNeeded(packet.channelIndex)) continue;
+    const size_t recordSize = remus::blade::relay::encodePacketRecord(
+      encoded.data(), encoded.size(), packet.receivedAtMs,
+      packet.payload, packet.length);
+    if (recordSize == 0 ||
+        !writeBladeRelayBytes(packet.channelIndex, encoded.data(), recordSize)) {
+      bladeRelayFiles[packet.channelIndex].flush();
+      bladeRelayFiles[packet.channelIndex].close();
+      Serial.printf("[BLADE RELAY] ❌ Falha no sidecar após %lu pacotes; RBP2 principal continua.\n",
+        readCounter(&channel.packetsPersisted));
+      continue;
+    }
+    incrementCounter(&channel.packetsPersisted);
+  }
+}
+
+void closeBladeRelayFile() {
+  processBladeRelayStorage(BLADE_RELAY_QUEUE_LENGTH);
+  for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
+    BladeChannel& channel = bladeChannels[index];
+    if (bladeRelayFiles[index]) {
+      bladeRelayFiles[index].flush();
+      bladeRelayFiles[index].close();
+    }
+    if (readCounter(&channel.notificationsReceived) == 0) continue;
+    Serial.printf("[BLADE RELAY] %s '%s': recebidos=%lu persistidos=%lu drops=%lu bytes=%lu falhas=%lu.\n",
+      __atomic_load_n(&channel.storageFault, __ATOMIC_RELAXED) ? "⚠️ INTERROMPIDO" : "⏹️ FINALIZADO",
+      currentBladeRelayFileNames[index],
+      readCounter(&channel.notificationsReceived),
+      readCounter(&channel.packetsPersisted),
+      readCounter(&channel.queueDropCount),
+      readCounter(&channel.bytesPersisted),
+      readCounter(&channel.writeFailureCount));
+  }
 }
 
 bool queueControlCommand(ControlCommandType type, const String& path = "") {
@@ -265,6 +604,7 @@ void persistLatestGpsFix() {
 class RemusBLEServerCallbacks: public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
     bleConnected = true;
+    bladeRosterDirty = true;
     if (!usbRecoveryTransferActive) Serial.println("[BLE] 📲 Cliente conectado com sucesso!");
   };
 
@@ -277,6 +617,297 @@ class RemusBLEServerCallbacks: public BLEServerCallbacks {
     if (!usbRecoveryTransferActive) Serial.println("[BLE] 📴 Cliente desconectado. Reiniciando anúncio...");
   }
 };
+
+int bladeChannelIndexForClient(BLEClient* client) {
+  for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
+    if (bladeChannels[index].client == client) return static_cast<int>(index);
+  }
+  return -1;
+}
+
+int bladeChannelIndexForCharacteristic(BLERemoteCharacteristic* characteristic) {
+  for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
+    if (bladeChannels[index].streamCharacteristic == characteristic ||
+        bladeChannels[index].clockSyncCharacteristic == characteristic) {
+      return static_cast<int>(index);
+    }
+  }
+  return -1;
+}
+
+void onBladeStreamNotification(BLERemoteCharacteristic* characteristic, uint8_t* data,
+                               size_t length, bool) {
+  if (!data || length == 0 || length > remus::blade::relay::kMaxPacketSize ||
+      (!isWorkoutActive &&
+       !__atomic_load_n(&bladeCalibrationRequested, __ATOMIC_RELAXED)) ||
+      !bladeRelayQueue) return;
+  const int channelIndex = bladeChannelIndexForCharacteristic(characteristic);
+  if (channelIndex < 0) return;
+  BladeChannel& channel = bladeChannels[channelIndex];
+  BladeRelayPacket packet{};
+  packet.channelIndex = static_cast<uint8_t>(channelIndex);
+  packet.sourceIdentityHash = channel.sourceIdentityHash;
+  packet.receivedAtMs = millis();
+  packet.length = static_cast<uint16_t>(length);
+  std::memcpy(packet.payload, data, length);
+  incrementCounter(&channel.notificationsReceived);
+  if (xQueueSend(bladeRelayQueue, &packet, 0) != pdTRUE) {
+    incrementCounter(&channel.queueDropCount);
+  }
+}
+
+void onBladeClockSyncNotification(BLERemoteCharacteristic* characteristic, uint8_t* data,
+                                  size_t length, bool) {
+  namespace protocol = remus::blade::protocol;
+  if (!data || length < 30 || data[0] != protocol::kVersion ||
+      data[1] != static_cast<uint8_t>(protocol::MessageType::ClockSyncResponse)) return;
+  const int channelIndex = bladeChannelIndexForCharacteristic(characteristic);
+  if (channelIndex < 0) return;
+  BladeChannel& channel = bladeChannels[channelIndex];
+  const uint64_t computerReceiveUs = static_cast<uint64_t>(esp_timer_get_time());
+  const uint64_t computerSendUs = protocol::readU64(data + 6);
+  const uint64_t bladeReceiveUs = protocol::readU64(data + 14);
+  const uint64_t bladeSendUs = protocol::readU64(data + 22);
+  if (computerReceiveUs < computerSendUs || bladeSendUs < bladeReceiveUs) return;
+  const int64_t roundTripUs = static_cast<int64_t>(computerReceiveUs - computerSendUs) -
+                              static_cast<int64_t>(bladeSendUs - bladeReceiveUs);
+  if (roundTripUs < 0 || roundTripUs > 200000) return;
+  const int64_t offsetUs = (
+      static_cast<int64_t>(computerSendUs) - static_cast<int64_t>(bladeReceiveUs) +
+      static_cast<int64_t>(computerReceiveUs) - static_cast<int64_t>(bladeSendUs)) / 2;
+  portENTER_CRITICAL(&bladeClockMux);
+  channel.clockMapping.scale = 1.0;
+  channel.clockMapping.offsetMicroseconds = offsetUs;
+  channel.clockMapping.maximumErrorMicroseconds = static_cast<uint64_t>(roundTripUs / 2);
+  channel.clockMapping.qualified = true;
+  portEXIT_CRITICAL(&bladeClockMux);
+}
+
+class BladeClientCallbacks final : public BLEClientCallbacks {
+ public:
+  void onConnect(BLEClient* client) override {
+    const int index = bladeChannelIndexForClient(client);
+    if (index < 0) return;
+    __atomic_store_n(&bladeChannels[index].connected, true, __ATOMIC_RELAXED);
+    Serial.printf("[BLADE RELAY] ✅ Blade %c conectado ao Remus Computer.\n",
+                  index == 0 ? 'L' : 'R');
+  }
+
+  void onDisconnect(BLEClient* client) override {
+    const int index = bladeChannelIndexForClient(client);
+    if (index < 0) return;
+    BladeChannel& channel = bladeChannels[index];
+    channel.controlCharacteristic = NULL;
+    channel.streamCharacteristic = NULL;
+    channel.clockSyncCharacteristic = NULL;
+    channel.clockMapping = {};
+    __atomic_store_n(&channel.connected, false, __ATOMIC_RELAXED);
+    __atomic_store_n(&channel.streamCommanded, false, __ATOMIC_RELAXED);
+    if (bladeOrientationMutex && xSemaphoreTake(bladeOrientationMutex, 0) == pdTRUE) {
+      dualBladeOrientation.reset(index == 0 ? remus::orientation::BladeSide::Left
+                                            : remus::orientation::BladeSide::Right);
+      xSemaphoreGive(bladeOrientationMutex);
+    }
+    Serial.printf("[BLADE RELAY] 📴 Blade %c desconectado; nova busca será tentada.\n",
+                  index == 0 ? 'L' : 'R');
+  }
+};
+
+bool isBladeAdvertisement(BLEAdvertisedDevice& device) {
+  if (device.haveManufacturerData()) {
+    const std::string manufacturer = device.getManufacturerData();
+    if (manufacturer.size() >= 2 &&
+        static_cast<uint8_t>(manufacturer[0]) == remus::blade::protocol::kVersion &&
+        static_cast<uint8_t>(manufacturer[1]) == remus::blade::protocol::kDeviceFamilyBlade) {
+      return true;
+    }
+  }
+  return device.haveName() && device.getName().rfind("REMUS-BLD-", 0) == 0;
+}
+
+bool sendBladeClockSyncRequest(size_t channelIndex) {
+  if (channelIndex >= BLADE_CHANNEL_COUNT) return false;
+  BladeChannel& channel = bladeChannels[channelIndex];
+  if (!channel.clockSyncCharacteristic || !channel.client || !channel.client->isConnected()) return false;
+  uint8_t request[14]{};
+  request[0] = remus::blade::protocol::kVersion;
+  request[1] = static_cast<uint8_t>(remus::blade::protocol::MessageType::ClockSyncResponse);
+  remus::blade::protocol::writeU32(request + 2, ++channel.clockSyncRequestId);
+  remus::blade::protocol::writeU64(
+    request + 6, static_cast<uint64_t>(esp_timer_get_time()));
+  channel.clockSyncCharacteristic->writeValue(request, sizeof(request), true);
+  channel.lastClockSyncMs = millis();
+  return true;
+}
+
+uint32_t advertisedBladeIdentity(BLEAdvertisedDevice& device) {
+  if (device.haveManufacturerData()) {
+    const std::string manufacturer = device.getManufacturerData();
+    if (manufacturer.size() >= 6) {
+      return static_cast<uint8_t>(manufacturer[2]) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(manufacturer[3])) << 8) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(manufacturer[4])) << 16) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(manufacturer[5])) << 24);
+    }
+    if (manufacturer.size() >= 4) {
+      return static_cast<uint8_t>(manufacturer[2]) |
+        (static_cast<uint32_t>(static_cast<uint8_t>(manufacturer[3])) << 8);
+    }
+  }
+  BLEAddress address = device.getAddress();
+  return remus::blade::protocol::crc32(
+    reinterpret_cast<const uint8_t*>(address.getNative()), 6);
+}
+
+void captureBladeIdentity(size_t channelIndex, BLEAdvertisedDevice& device) {
+  BladeChannel& channel = bladeChannels[channelIndex];
+  BLEAddress address = device.getAddress();
+  std::memcpy(channel.sourceAddress, address.getNative(), sizeof(channel.sourceAddress));
+  channel.sourceIdentityHash = advertisedBladeIdentity(device);
+}
+
+bool sendBladeStreamCommand(size_t channelIndex, bool start) {
+  if (channelIndex >= BLADE_CHANNEL_COUNT) return false;
+  BladeChannel& channel = bladeChannels[channelIndex];
+  if (!channel.controlCharacteristic || !channel.client || !channel.client->isConnected()) return false;
+  uint8_t request[6]{};
+  request[0] = remus::blade::protocol::kVersion;
+  request[1] = static_cast<uint8_t>(start
+    ? remus::blade::protocol::ControlCommand::StartStream
+    : remus::blade::protocol::ControlCommand::StopStream);
+  remus::blade::protocol::writeU32(request + 2, ++channel.controlRequestId);
+  channel.controlCharacteristic->writeValue(request, sizeof(request), true);
+  __atomic_store_n(&channel.streamCommanded, start, __ATOMIC_RELAXED);
+  Serial.printf("[BLADE RELAY] %s solicitado para %c (request=%lu).\n",
+    start ? "START" : "STOP", channelIndex == 0 ? 'L' : 'R',
+    static_cast<unsigned long>(channel.controlRequestId));
+  return true;
+}
+
+bool connectBlade(size_t channelIndex, BLEAdvertisedDevice& device) {
+  if (channelIndex >= BLADE_CHANNEL_COUNT) return false;
+  BladeChannel& channel = bladeChannels[channelIndex];
+  if (!channel.client) {
+    channel.client = BLEDevice::createClient();
+    if (!channel.client) return false;
+    channel.client->setClientCallbacks(new BladeClientCallbacks());
+  }
+  if (!channel.client->connect(&device)) return false;
+  channel.client->setMTU(185);
+  BLERemoteService* service = channel.client->getService(SERVICE_UUID);
+  if (!service) {
+    channel.client->disconnect();
+    return false;
+  }
+  channel.controlCharacteristic = service->getCharacteristic(BLADE_CONTROL_CHARACTERISTIC_UUID);
+  channel.streamCharacteristic = service->getCharacteristic(IMU_STREAM_CHARACTERISTIC_UUID);
+  channel.clockSyncCharacteristic = service->getCharacteristic(BLADE_CLOCK_SYNC_CHARACTERISTIC_UUID);
+  if (!channel.controlCharacteristic || !channel.streamCharacteristic ||
+      !channel.controlCharacteristic->canWrite() || !channel.streamCharacteristic->canNotify()) {
+    channel.client->disconnect();
+    return false;
+  }
+  captureBladeIdentity(channelIndex, device);
+  channel.streamCharacteristic->registerForNotify(onBladeStreamNotification);
+  if (channel.clockSyncCharacteristic && channel.clockSyncCharacteristic->canWrite() &&
+      channel.clockSyncCharacteristic->canNotify()) {
+    channel.clockSyncCharacteristic->registerForNotify(onBladeClockSyncNotification);
+    sendBladeClockSyncRequest(channelIndex);
+  }
+  const auto side = channelIndex == 0 ? remus::orientation::BladeSide::Left
+                                      : remus::orientation::BladeSide::Right;
+  if (bladeOrientationMutex &&
+      xSemaphoreTake(bladeOrientationMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+    dualBladeOrientation.configure(side, channel.sourceIdentityHash, channel.clockMapping);
+    xSemaphoreGive(bladeOrientationMutex);
+  }
+  __atomic_store_n(&channel.connected, true, __ATOMIC_RELAXED);
+  return true;
+}
+
+int selectBladeChannel(uint32_t identityHash) {
+  for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
+    const auto assignment = bladeAssignment(
+      index == 0 ? remus::blade::Slot::Left : remus::blade::Slot::Right);
+    if (assignment.configured && assignment.sourceIdentityHash == identityHash) {
+      return static_cast<int>(index);
+    }
+  }
+  for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
+    const auto assignment = bladeAssignment(
+      index == 0 ? remus::blade::Slot::Left : remus::blade::Slot::Right);
+    BladeChannel& channel = bladeChannels[index];
+    if (!assignment.configured && (!channel.client || !channel.client->isConnected()) &&
+        channel.sourceIdentityHash == 0) {
+      channel.provisionallyDiscovered = true;
+      return static_cast<int>(index);
+    }
+  }
+  return -1;
+}
+
+void bladeRelayClientTask(void*) {
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(160);
+  scan->setWindow(48);
+  for (;;) {
+    if (__atomic_load_n(&bladeCalibrationRequested, __ATOMIC_RELAXED) &&
+        millis() - __atomic_load_n(&bladeCalibrationRequestedAtMs, __ATOMIC_RELAXED) >= 15000) {
+      __atomic_store_n(&bladeCalibrationRequested, false, __ATOMIC_RELAXED);
+      notifyBladeSlotState("CALIBRATION_TIMEOUT");
+    }
+    bool allConnected = true;
+    for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
+      BladeChannel& channel = bladeChannels[index];
+      if (channel.client && channel.client->isConnected()) {
+        const bool shouldStream = isWorkoutActive ||
+          __atomic_load_n(&bladeCalibrationRequested, __ATOMIC_RELAXED);
+        if (shouldStream != __atomic_load_n(&channel.streamCommanded, __ATOMIC_RELAXED)) {
+          sendBladeStreamCommand(index, shouldStream);
+        }
+        if (millis() - channel.lastClockSyncMs >= 10000) sendBladeClockSyncRequest(index);
+      } else {
+        allConnected = false;
+      }
+    }
+    if (allConnected) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      continue;
+    }
+
+    // Discovery is deliberately low duty-cycle. During a workout it retries,
+    // but does not monopolize the radio used by the app-facing live stream.
+    BLEScanResults results = scan->start(2, false);
+    bool connectedAny = false;
+    for (int index = 0; index < results.getCount(); ++index) {
+      BLEAdvertisedDevice device = results.getDevice(index);
+      if (!isBladeAdvertisement(device)) continue;
+      const uint32_t identityHash = advertisedBladeIdentity(device);
+      bool alreadyConnected = false;
+      for (const BladeChannel& channel : bladeChannels) {
+        if (channel.client && channel.client->isConnected() &&
+            channel.sourceIdentityHash == identityHash) alreadyConnected = true;
+      }
+      if (alreadyConnected) continue;
+      const int channelIndex = selectBladeChannel(identityHash);
+      if (channelIndex < 0) continue;
+      scan->stop();
+      connectedAny = connectBlade(static_cast<size_t>(channelIndex), device) || connectedAny;
+      if (connectedAny) break;  // reconnect sequentially to protect the single radio.
+    }
+    scan->clearResults();
+    if (!bleConnected && pServer) pServer->startAdvertising();
+    if (connectedAny && isWorkoutActive) {
+      for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
+        if (bladeChannels[index].client && bladeChannels[index].client->isConnected()) {
+          sendBladeStreamCommand(index, true);
+        }
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(connectedAny ? 200 : (isWorkoutActive ? 10000 : 3000)));
+  }
+}
 
 void handleGpsAiding(const String& cmd) {
   int firstComma = cmd.indexOf(',');
@@ -295,6 +926,122 @@ void handleGpsAiding(const String& cmd) {
   }
 }
 
+void persistBladeSlots() {
+  const auto left = bladeAssignment(remus::blade::Slot::Left);
+  const auto right = bladeAssignment(remus::blade::Slot::Right);
+  const uint32_t revision = bladeSlotRevision();
+  prefs.begin("remus_slots", false);
+  prefs.putUInt("left", left.sourceIdentityHash);
+  prefs.putUInt("right", right.sourceIdentityHash);
+  prefs.putUInt("revision", revision);
+  prefs.end();
+}
+
+void loadBladeSlots() {
+  prefs.begin("remus_slots", true);
+  const uint32_t left = prefs.getUInt("left", 0);
+  const uint32_t right = prefs.getUInt("right", 0);
+  const uint32_t revision = prefs.getUInt("revision", 0);
+  prefs.end();
+  portENTER_CRITICAL(&bladeSlotMux);
+  bladeSlotRegistry.restore(left, right, revision);
+  portEXIT_CRITICAL(&bladeSlotMux);
+  Serial.printf("[BLADE SLOT] Restaurado rev=%lu left=%08lX right=%08lX.\n",
+                static_cast<unsigned long>(revision), static_cast<unsigned long>(left),
+                static_cast<unsigned long>(right));
+}
+
+void notifyBladeSlotState(const char* status) {
+  if (!bleConnected || !pCharacteristic) return;
+  const auto left = bladeAssignment(remus::blade::Slot::Left);
+  const auto right = bladeAssignment(remus::blade::Slot::Right);
+  char response[96];
+  snprintf(response, sizeof(response), "BLADE_SLOTS,%s,%lu,%08lX,%08lX",
+           status, static_cast<unsigned long>(bladeSlotRevision()),
+           static_cast<unsigned long>(left.sourceIdentityHash),
+           static_cast<unsigned long>(right.sourceIdentityHash));
+  pCharacteristic->setValue(response);
+  pCharacteristic->notify();
+}
+
+void notifyBladeRoster(bool force) {
+  if (!bleConnected || !pCharacteristic) return;
+  const uint32_t leftHash = bladeChannels[0].sourceIdentityHash;
+  const uint32_t rightHash = bladeChannels[1].sourceIdentityHash;
+  const auto leftAssignment = bladeAssignment(remus::blade::Slot::Left);
+  const auto rightAssignment = bladeAssignment(remus::blade::Slot::Right);
+  const uint32_t revision = bladeSlotRevision();
+  const bool leftConnected = __atomic_load_n(&bladeChannels[0].connected, __ATOMIC_RELAXED);
+  const bool rightConnected = __atomic_load_n(&bladeChannels[1].connected, __ATOMIC_RELAXED);
+  const uint32_t signature = leftHash ^ (rightHash * 16777619UL) ^
+    (leftConnected ? 0x40000000UL : 0) ^ (rightConnected ? 0x80000000UL : 0) ^
+    revision;
+  static uint32_t lastSignature = 0;
+  if (!force && !bladeRosterDirty && signature == lastSignature) return;
+  lastSignature = signature;
+  bladeRosterDirty = false;
+  char response[112];
+  snprintf(response, sizeof(response),
+    "BLADE_ROSTER,%lu,%08lX:%d:%c,%08lX:%d:%c",
+    static_cast<unsigned long>(revision),
+    static_cast<unsigned long>(leftHash), leftConnected ? 1 : 0,
+    leftAssignment.configured ? 'L' : 'U',
+    static_cast<unsigned long>(rightHash), rightConnected ? 1 : 0,
+    rightAssignment.configured ? 'R' : 'U');
+  pCharacteristic->setValue(response);
+  pCharacteristic->notify();
+}
+
+bool configureBladeSlot(remus::blade::Slot slot, uint32_t identityHash) {
+  portENTER_CRITICAL(&bladeSlotMux);
+  const bool assigned = bladeSlotRegistry.assign(slot, identityHash);
+  portEXIT_CRITICAL(&bladeSlotMux);
+  if (!assigned) return false;
+  persistBladeSlots();
+  for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
+    const auto assignment = bladeAssignment(
+      index == 0 ? remus::blade::Slot::Left : remus::blade::Slot::Right);
+    BladeChannel& channel = bladeChannels[index];
+    if (channel.client && channel.client->isConnected() &&
+        channel.sourceIdentityHash != assignment.sourceIdentityHash) {
+      channel.client->disconnect();
+    }
+    if (!channel.client || !channel.client->isConnected()) {
+      channel.sourceIdentityHash = 0;
+      channel.provisionallyDiscovered = false;
+    }
+  }
+  return true;
+}
+
+void handleBladeSlotCommand(const String& command) {
+  if (command.equalsIgnoreCase("BLADE_SLOTS?")) {
+    notifyBladeSlotState("STATE");
+    return;
+  }
+  const int firstComma = command.indexOf(',');
+  const int secondComma = command.indexOf(',', firstComma + 1);
+  if (firstComma < 0 || secondComma < 0) {
+    notifyBladeSlotState("INVALID");
+    return;
+  }
+  String sideText = command.substring(firstComma + 1, secondComma);
+  String identityText = command.substring(secondComma + 1);
+  sideText.trim();
+  identityText.trim();
+  const bool left = sideText.equalsIgnoreCase("L") || sideText.equalsIgnoreCase("LEFT");
+  const bool right = sideText.equalsIgnoreCase("R") || sideText.equalsIgnoreCase("RIGHT");
+  char* end = nullptr;
+  const uint32_t identityHash = static_cast<uint32_t>(strtoul(identityText.c_str(), &end, 16));
+  if ((!left && !right) || identityHash == 0 || !end || *end != '\0') {
+    notifyBladeSlotState("INVALID");
+    return;
+  }
+  const bool accepted = configureBladeSlot(
+    left ? remus::blade::Slot::Left : remus::blade::Slot::Right, identityHash);
+  notifyBladeSlotState(accepted ? "ACCEPTED" : "CONFLICT");
+}
+
 class RemusCharacteristicCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pChar) override {
     String rxValue = pChar->getValue().c_str();
@@ -303,6 +1050,13 @@ class RemusCharacteristicCallbacks : public BLECharacteristicCallbacks {
       if (!usbRecoveryTransferActive) Serial.printf("[BLE RX] 📥 Comando recebido: %s\n", rxValue.c_str());
       if (rxValue.startsWith("AID,")) {
         handleGpsAiding(rxValue);
+      } else if (rxValue.startsWith("BLADE_SLOT,") ||
+                 rxValue.equalsIgnoreCase("BLADE_SLOTS?")) {
+        handleBladeSlotCommand(rxValue);
+      } else if (rxValue.equalsIgnoreCase("BLADE_CALIBRATE")) {
+        __atomic_store_n(&bladeCalibrationRequestedAtMs, millis(), __ATOMIC_RELAXED);
+        __atomic_store_n(&bladeCalibrationRequested, true, __ATOMIC_RELAXED);
+        notifyBladeSlotState("CALIBRATION_PENDING");
       } else if (rxValue.equalsIgnoreCase("START") || rxValue.startsWith("START")) {
         queueControlCommand(ControlCommandType::Start);
       } else if (rxValue.equalsIgnoreCase("STOP") || rxValue.startsWith("STOP")) {
@@ -354,6 +1108,18 @@ void setupBLE() {
                     );
   pCharacteristic->addDescriptor(new BLE2902());
   pCharacteristic->setCallbacks(new RemusCharacteristicCallbacks());
+
+  pImuStreamCharacteristic = pService->createCharacteristic(
+                      IMU_STREAM_CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pImuStreamCharacteristic->addDescriptor(new BLE2902());
+
+  pBladeRelayCharacteristic = pService->createCharacteristic(
+                      BLADE_RELAY_CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pBladeRelayCharacteristic->addDescriptor(new BLE2902());
 
   pService->start();
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -493,7 +1259,17 @@ void updateDisplay(bool force) {
   telemetry.satellitesInUse = telemetry.gpsFix ? gpsDevice.satellitesInUse() : 0;
   telemetry.satellitesInView = static_cast<uint8_t>(
     constrain(gpsDevice.satellitesInView(), 0, 255));
-  telemetry.recordsWritten = readCounter(&recordsWritten);
+  telemetry.recordsWritten = readCounter(&recordsPersisted);
+  remus::orientation::DualBladeSnapshot bladeSnapshot{};
+  if (bladeOrientationMutex && xSemaphoreTake(bladeOrientationMutex, 0) == pdTRUE) {
+    bladeSnapshot = dualBladeOrientation.snapshot();
+    xSemaphoreGive(bladeOrientationMutex);
+  }
+  telemetry.bladeAlignmentAvailable = bladeSnapshot.alignment.available;
+  telemetry.relativeEquipmentAlignmentDegrees =
+    bladeSnapshot.alignment.relativeEquipmentAlignmentDegrees;
+  telemetry.orientationQuality = static_cast<uint8_t>(
+    bladeSnapshot.alignment.orientationQuality);
   displayDevice.render(telemetry, force);
 }
 
@@ -506,7 +1282,7 @@ void startWorkoutRecording() {
     Serial.println("[SD] ⚠️ Não é possível iniciar gravação: MicroSD offline.");
     return;
   }
-  if (isWorkoutActive && logFile) {
+  if (isWorkoutActive) {
     Serial.println("[SD] ⚠️ Gravação do workout já está ativa.");
     return;
   }
@@ -536,8 +1312,16 @@ void startWorkoutRecording() {
   }
 
   // Gera nome único para o novo arquivo (ex: /remus_sensor_1A2B3C4D.bin) sem apagar dados anteriores
-  uint32_t sessionId = esp_random();
-  snprintf(currentSessionFileName, sizeof(currentSessionFileName), "/remus_sensor_%08X.bin", sessionId);
+  closeBladeRelayFile();
+  currentSessionId = esp_random();
+  currentSessionStartedAtMs = millis();
+  snprintf(currentSessionFileName, sizeof(currentSessionFileName), "/remus_sensor_%08X.bin", currentSessionId);
+  for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
+    snprintf(currentBladeRelayFileNames[index], sizeof(currentBladeRelayFileNames[index]),
+      "/remus_blade_%08X_%c_%08lX.rbr", currentSessionId,
+      index == 0 ? 'L' : 'R',
+      static_cast<unsigned long>(bladeChannels[index].sourceIdentityHash));
+  }
 
   logFile = SD.open(currentSessionFileName, FILE_WRITE);
   if (!logFile) {
@@ -548,16 +1332,47 @@ void startWorkoutRecording() {
   }
 
   // RBP2 keeps the RBP1 IMU/SPM layout and adds coherent receiver-native GNSS.
-  RemusFileHeader header = remus::session::makeHeaderV2(millis(), sessionId, 200);
+  RemusFileHeader header = remus::session::makeHeaderV2(
+    currentSessionStartedAtMs, currentSessionId, 200);
   header.padding[0] = static_cast<uint8_t>(remus::hardware.id);
   header.padding[1] = static_cast<uint8_t>(remus::hardware.imuModel);
   header.padding[2] = static_cast<uint8_t>(remus::hardware.gpsModel);
   header.padding[3] = remus::esp32::hw::capabilityByte(remus::hardware);
 
-  logFile.write((const uint8_t*)&header, sizeof(header));
-  logFile.flush();
+  __atomic_store_n(&recordsQueued, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&recordsPersisted, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&bytesPersisted, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&storageWriteFailureCount, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&recordingStorageFault, false, __ATOMIC_RELAXED);
+  __atomic_store_n(&pcLiveSampleSequence, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&pcLiveBatchSequence, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&pcLiveQueueDropCount, 0UL, __ATOMIC_RELAXED);
+  for (BladeChannel& channel : bladeChannels) {
+    __atomic_store_n(&channel.notificationsReceived, 0UL, __ATOMIC_RELAXED);
+    __atomic_store_n(&channel.packetsPersisted, 0UL, __ATOMIC_RELAXED);
+    __atomic_store_n(&channel.bytesPersisted, 0UL, __ATOMIC_RELAXED);
+    __atomic_store_n(&channel.queueDropCount, 0UL, __ATOMIC_RELAXED);
+    __atomic_store_n(&channel.writeFailureCount, 0UL, __ATOMIC_RELAXED);
+    __atomic_store_n(&channel.liveDropCount, 0UL, __ATOMIC_RELAXED);
+    __atomic_store_n(&channel.storageFault, false, __ATOMIC_RELAXED);
+    __atomic_store_n(&channel.liveSequence, 0U, __ATOMIC_RELAXED);
+  }
+  persistedRecordBytesRemaining = 0;
+  if (pcLiveImuQueue) xQueueReset(pcLiveImuQueue);
+  if (bladeRelayQueue) xQueueReset(bladeRelayQueue);
 
-  __atomic_store_n(&recordsWritten, 0UL, __ATOMIC_RELAXED);
+  const size_t headerBytes = logFile.write((const uint8_t*)&header, sizeof(header));
+  if (headerBytes != sizeof(header)) {
+    incrementCounter(&storageWriteFailureCount);
+    __atomic_store_n(&recordingStorageFault, true, __ATOMIC_RELAXED);
+    logFile.close();
+    sdOk = false;
+    Serial.printf("[SD] ❌ Cabeçalho incompleto: %u/%u bytes. Somente o stream ao app continuará.\n",
+      static_cast<unsigned int>(headerBytes), static_cast<unsigned int>(sizeof(header)));
+  } else {
+    logFile.flush();
+  }
+
   __atomic_store_n(&imuGapCount, 0UL, __ATOMIC_RELAXED);
   __atomic_store_n(&maxImuGapMs, 0UL, __ATOMIC_RELAXED);
   __atomic_store_n(&imuReadFailureCount, 0UL, __ATOMIC_RELAXED);
@@ -586,7 +1401,11 @@ void startWorkoutRecording() {
   __atomic_store_n(&liveSpmPreviewEnabled, true, __ATOMIC_RELAXED);
   xSemaphoreGive(recordingStateMutex);
   updateDisplay();
-  Serial.printf("[SD] 🔴 Gravação do Workout INICIADA em binário: %s\n", currentSessionFileName);
+  if (__atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED)) {
+    Serial.println("[BLE] 🔴 Workout iniciado em modo degradado: IMU bruto somente no app.");
+  } else {
+    Serial.printf("[SD] 🔴 Gravação do Workout INICIADA em binário: %s\n", currentSessionFileName);
+  }
 }
 
 void stopWorkoutRecording() {
@@ -620,8 +1439,12 @@ void stopWorkoutRecording() {
       while (true) {
         uint8_t* pData = (uint8_t*)xRingbufferReceiveUpTo(s_recordingRingBuf, &rxSize, 0, 4096);
         if (pData != NULL && rxSize > 0) {
-          logFile.write(pData, rxSize);
+          const bool persisted = writeRecordingBytes(pData, rxSize);
           vRingbufferReturnItem(s_recordingRingBuf, pData);
+          if (!persisted) {
+            abortRecordingAfterStorageFailure(rxSize);
+            break;
+          }
         } else {
           break;
         }
@@ -630,14 +1453,20 @@ void stopWorkoutRecording() {
     logFile.flush();
     logFile.close();
   }
+  closeBladeRelayFile();
 
   // Persist only the latest GPS recovery snapshot after the time-sensitive
   // recording path has stopped. Repeated NVS commits during capture caused
   // long IMU gaps and invalidated the 15-second cadence windows.
   persistLatestGpsFix();
   updateDisplay();
-  Serial.printf("[SD] ⏹️ Gravação FINALIZADA! Arquivo '%s' preservado no SD. Registros: %lu (Overflows: %lu)\n",
-    currentSessionFileName, readCounter(&recordsWritten), readCounter(&ringBufferOverflowCount));
+  const bool complete = !__atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED) &&
+    persistedRecordBytesRemaining == 0;
+  Serial.printf("[SD] %s Arquivo '%s' preservado. Fila=%lu, persistidos=%lu, bytes=%lu, overflows=%lu, falhas=%lu\n",
+    complete ? "⏹️ Gravação FINALIZADA!" : "⚠️ Gravação INTERROMPIDA!",
+    currentSessionFileName, readCounter(&recordsQueued), readCounter(&recordsPersisted),
+    readCounter(&bytesPersisted), readCounter(&ringBufferOverflowCount),
+    readCounter(&storageWriteFailureCount));
 }
 
 String findLatestSessionFileOnSd() {
@@ -777,11 +1606,11 @@ void startFileTransfer(const String& targetFile) {
 
   Serial.printf("[TRANSFER] 🚀 '%s': %u bytes, MTU=%u, payload=%u B, records=%lu\n",
     resolvedPath.c_str(), transferTotalBytes, transferPeerMtu,
-    (unsigned int)transferMaxPayload, readCounter(&recordsWritten));
+    (unsigned int)transferMaxPayload, readCounter(&recordsPersisted));
 
   char startBuf[112];
   snprintf(startBuf, sizeof(startBuf), "FILE_START:%s:%u:%lu",
-    resolvedPath.c_str(), transferTotalBytes, readCounter(&recordsWritten));
+    resolvedPath.c_str(), transferTotalBytes, readCounter(&recordsPersisted));
 
   if (!sendTransferText(startBuf, 20)) {
     Serial.printf("[TRANSFER] ❌ FILE_START não pôde ser enfileirado no BLE (code=%lu).\n",
@@ -1425,7 +2254,7 @@ void imuSamplingTask(void* pvParameters) {
     gx = sample.gyroX; gy = sample.gyroY; gz = sample.gyroZ;
     portEXIT_CRITICAL(&telemetryMux);
 
-    if (!recording || !s_recordingRingBuf) {
+    if (!recording) {
       spmAccumulatorCount = 0;
       spmAxSum = spmAySum = spmAzSum = 0.0f;
       xSemaphoreGive(recordingStateMutex);
@@ -1443,10 +2272,29 @@ void imuSamplingTask(void* pvParameters) {
     imuRec.gy = sample.rawGy;
     imuRec.gz = sample.rawGz;
 
-    if (xRingbufferSend(s_recordingRingBuf, &imuRec, sizeof(imuRec), 0) == pdTRUE) {
-      incrementCounter(&recordsWritten);
-    } else {
-      incrementCounter(&ringBufferOverflowCount);
+    if (!__atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED) && s_recordingRingBuf) {
+      if (xRingbufferSend(s_recordingRingBuf, &imuRec, sizeof(imuRec), 0) == pdTRUE) {
+        incrementCounter(&recordsQueued);
+      } else {
+        incrementCounter(&ringBufferOverflowCount);
+      }
+    }
+
+    const uint32_t liveSequence = __atomic_fetch_add(
+      &pcLiveSampleSequence, 1U, __ATOMIC_RELAXED);
+    if (bleConnected && pcLiveImuQueue) {
+      remus::blade::protocol::RawImuFrame liveFrame{};
+      liveFrame.sampleSequence = liveSequence;
+      liveFrame.nativeTimestampUs = static_cast<uint64_t>(esp_timer_get_time());
+      liveFrame.ax = sample.rawAx;
+      liveFrame.ay = sample.rawAy;
+      liveFrame.az = sample.rawAz;
+      liveFrame.gx = sample.rawGx;
+      liveFrame.gy = sample.rawGy;
+      liveFrame.gz = sample.rawGz;
+      if (xQueueSend(pcLiveImuQueue, &liveFrame, 0) != pdTRUE) {
+        incrementCounter(&pcLiveQueueDropCount);
+      }
     }
 
     // 2) Preview SPM: média simples de 8 amostras = ~25 Hz. Isso reduz
@@ -1485,6 +2333,121 @@ void imuSamplingTask(void* pvParameters) {
     }
 
     xSemaphoreGive(recordingStateMutex);
+  }
+}
+
+void notifyPcLiveBatch(const uint8_t* batch, size_t batchLength, uint32_t batchSequence) {
+  namespace protocol = remus::blade::protocol;
+  if (!bleConnected || !pImuStreamCharacteristic || !batch || batchLength == 0) return;
+  const size_t mtuPayload = BLEDevice::getMTU() > 3 ? BLEDevice::getMTU() - 3 : 20;
+  if (batchLength <= mtuPayload) {
+    pImuStreamCharacteristic->setValue(const_cast<uint8_t*>(batch), batchLength);
+    pImuStreamCharacteristic->notify();
+    return;
+  }
+  if (mtuPayload <= protocol::kFragmentHeaderSize) {
+    incrementCounter(&pcLiveQueueDropCount);
+    return;
+  }
+  const size_t fragmentPayload = mtuPayload - protocol::kFragmentHeaderSize;
+  const size_t fragmentCountSize = (batchLength + fragmentPayload - 1) / fragmentPayload;
+  if (fragmentCountSize > 255) {
+    incrementCounter(&pcLiveQueueDropCount);
+    return;
+  }
+  std::array<uint8_t, 256> fragment{};
+  const uint8_t fragmentCount = static_cast<uint8_t>(fragmentCountSize);
+  for (uint8_t index = 0; index < fragmentCount && bleConnected; ++index) {
+    const size_t offset = static_cast<size_t>(index) * fragmentPayload;
+    const size_t length = std::min(fragmentPayload, batchLength - offset);
+    const size_t encoded = protocol::encodeFragment(
+      fragment.data(), fragment.size(), batchSequence, index, fragmentCount,
+      batch + offset, length);
+    pImuStreamCharacteristic->setValue(fragment.data(), encoded);
+    pImuStreamCharacteristic->notify();
+    taskYIELD();
+  }
+}
+
+void notifyBladeRelayPacket(const BladeRelayPacket& packet) {
+  namespace protocol = remus::blade::protocol;
+  if (!bleConnected || !pBladeRelayCharacteristic || packet.length == 0) return;
+  if (packet.channelIndex >= BLADE_CHANNEL_COUNT) return;
+  BladeChannel& channel = bladeChannels[packet.channelIndex];
+  std::array<uint8_t, protocol::kMaxRelayedPacketSize> relayed{};
+  const size_t relayedLength = protocol::encodeRelayedPacket(
+    relayed.data(), relayed.size(), packet.sourceIdentityHash,
+    packet.receivedAtMs, packet.payload, packet.length);
+  if (relayedLength == 0) {
+    incrementCounter(&channel.liveDropCount);
+    return;
+  }
+
+  uint16_t peerMtu = 23;
+  if (pServer) {
+    const uint16_t candidate = pServer->getPeerMTU(pServer->getConnId());
+    if (candidate >= 23 && candidate <= 512) peerMtu = candidate;
+  }
+  const size_t mtuPayload = peerMtu - 3;
+  if (relayedLength <= mtuPayload) {
+    pBladeRelayCharacteristic->setValue(relayed.data(), relayedLength);
+    pBladeRelayCharacteristic->notify();
+    return;
+  }
+  if (mtuPayload <= protocol::kFragmentHeaderSize) {
+    incrementCounter(&channel.liveDropCount);
+    return;
+  }
+  const size_t fragmentPayload = mtuPayload - protocol::kFragmentHeaderSize;
+  const size_t fragmentCountSize = (relayedLength + fragmentPayload - 1) / fragmentPayload;
+  if (fragmentCountSize > 255) {
+    incrementCounter(&channel.liveDropCount);
+    return;
+  }
+  const uint32_t relaySequence = __atomic_fetch_add(
+    &channel.liveSequence, 1U, __ATOMIC_RELAXED);
+  std::array<uint8_t, 256> fragment{};
+  const uint8_t fragmentCount = static_cast<uint8_t>(fragmentCountSize);
+  for (uint8_t index = 0; index < fragmentCount && bleConnected; ++index) {
+    const size_t offset = static_cast<size_t>(index) * fragmentPayload;
+    const size_t length = std::min(fragmentPayload, relayedLength - offset);
+    const size_t encoded = protocol::encodeFragment(
+      fragment.data(), fragment.size(), relaySequence, index, fragmentCount,
+      relayed.data() + offset, length);
+    if (encoded == 0) {
+      incrementCounter(&channel.liveDropCount);
+      return;
+    }
+    pBladeRelayCharacteristic->setValue(fragment.data(), encoded);
+    pBladeRelayCharacteristic->notify();
+    taskYIELD();
+  }
+}
+
+void pcLiveImuStreamingTask(void*) {
+  namespace protocol = remus::blade::protocol;
+  std::array<protocol::RawImuFrame, protocol::kMaxSamplesPerBatch> samples{};
+  std::array<uint8_t, protocol::kMaxBatchSize> encoded{};
+  for (;;) {
+    if (!isWorkoutActive || !bleConnected || !pcLiveImuQueue) {
+      if (pcLiveImuQueue) xQueueReset(pcLiveImuQueue);
+      vTaskDelay(pdMS_TO_TICKS(20));
+      continue;
+    }
+    size_t count = 0;
+    if (xQueueReceive(pcLiveImuQueue, &samples[count], pdMS_TO_TICKS(100)) == pdTRUE) {
+      ++count;
+    }
+    while (count < samples.size() &&
+           xQueueReceive(pcLiveImuQueue, &samples[count], pdMS_TO_TICKS(6)) == pdTRUE) {
+      ++count;
+    }
+    if (count == 0) continue;
+    const uint32_t batchSequence = __atomic_fetch_add(
+      &pcLiveBatchSequence, 1U, __ATOMIC_RELAXED);
+    const size_t length = protocol::encodeImuBatch(
+      encoded.data(), encoded.size(), batchSequence, samples.data(), count);
+    notifyPcLiveBatch(encoded.data(), length, batchSequence);
   }
 }
 
@@ -1549,7 +2512,8 @@ void liveSpmProcessingTask(void* pvParameters) {
       // Quando held=true a UI conserva temporariamente o último SPM confiável,
       // mas não gravamos outro 0x03: análise offline continua distinguindo uma
       // medição aceita de um simples hold de apresentação.
-      if (!spmRes.held && recordingStateMutex && s_recordingRingBuf) {
+      if (!spmRes.held && recordingStateMutex && s_recordingRingBuf &&
+          !__atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED)) {
         xSemaphoreTake(recordingStateMutex, portMAX_DELAY);
         if (isWorkoutActive && sample.generation == __atomic_load_n(&liveSpmGeneration, __ATOMIC_RELAXED)) {
           RemusSpmRecord spmRec;
@@ -1557,7 +2521,7 @@ void liveSpmProcessingTask(void* pvParameters) {
           spmRec.timestamp_ms = (uint32_t)millis();
           spmRec.spm_x10 = (uint16_t)(currentSpm * 10.0f);
           if (xRingbufferSend(s_recordingRingBuf, &spmRec, sizeof(spmRec), 0) == pdTRUE) {
-            incrementCounter(&recordsWritten);
+            incrementCounter(&recordsQueued);
           } else {
             incrementCounter(&ringBufferOverflowCount);
           }
@@ -1575,7 +2539,8 @@ void liveSpmProcessingTask(void* pvParameters) {
       // Zero is evidence of a confirmed stop, not a substitute for an
       // unavailable/ambiguous estimate. Emit exactly on the non-zero -> quiet
       // transition; subsequent quiet windows see liveSpm already at zero.
-      if (stoppedFromActiveCadence && recordingStateMutex && s_recordingRingBuf) {
+      if (stoppedFromActiveCadence && recordingStateMutex && s_recordingRingBuf &&
+          !__atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED)) {
         RemusSpmRecord spmRec{};
         spmRec.type = 0x03;
         spmRec.timestamp_ms = sample.timestamp_ms;
@@ -1584,7 +2549,7 @@ void liveSpmProcessingTask(void* pvParameters) {
         if (isWorkoutActive && sample.generation ==
             __atomic_load_n(&liveSpmGeneration, __ATOMIC_RELAXED)) {
           if (xRingbufferSend(s_recordingRingBuf, &spmRec, sizeof(spmRec), 0) == pdTRUE) {
-            incrementCounter(&recordsWritten);
+            incrementCounter(&recordsQueued);
           } else {
             incrementCounter(&ringBufferOverflowCount);
           }
@@ -1616,12 +2581,17 @@ static void remusAppBeginImpl() {
   Serial.printf("       Firmware %s | Session format RBP2\n", REMUS_FIRMWARE_VERSION);
   Serial.println("=========================================================");
   printHardwareProfile();
+  loadBladeSlots();
 
   // 1. Inicializa sincronização, comandos e RingBuffer de gravação.
   recordingStateMutex = xSemaphoreCreateMutex();
+  bladeOrientationMutex = xSemaphoreCreateMutex();
   controlCommandQueue = xQueueCreate(4, sizeof(ControlCommand));
   s_recordingRingBuf = xRingbufferCreate(RECORDING_RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
   liveSpmSampleQueue = xQueueCreate(LIVE_SPM_QUEUE_LENGTH, sizeof(LiveSpmInputSample));
+  pcLiveImuQueue = xQueueCreate(
+    PC_LIVE_IMU_QUEUE_LENGTH, sizeof(remus::blade::protocol::RawImuFrame));
+  bladeRelayQueue = xQueueCreate(BLADE_RELAY_QUEUE_LENGTH, sizeof(BladeRelayPacket));
   if (s_recordingRingBuf && recordingStateMutex && controlCommandQueue) {
     Serial.printf("[BUF] ✅ Pipeline RAM alocado com sucesso (%u bytes)\n", (unsigned int)RECORDING_RING_BUFFER_SIZE);
   } else {
@@ -1631,6 +2601,18 @@ static void remusAppBeginImpl() {
     Serial.printf("[SPM] ✅ Fila de preview criada (%u amostras a ~25 Hz).\n", (unsigned int)LIVE_SPM_QUEUE_LENGTH);
   } else {
     Serial.println("[SPM] ⚠️ Fila de preview indisponível. Gravação bruta continuará normalmente.");
+  }
+  if (pcLiveImuQueue) {
+    Serial.printf("[BLE] ✅ Fila do stream bruto alocada (%u amostras).\n",
+      static_cast<unsigned int>(PC_LIVE_IMU_QUEUE_LENGTH));
+  } else {
+    Serial.println("[BLE] ⚠️ Stream bruto ao app indisponível; gravação local continua operacional.");
+  }
+  if (bladeRelayQueue) {
+    Serial.printf("[BLADE RELAY] ✅ Fila de backup criada (%u notificações).\n",
+      static_cast<unsigned int>(BLADE_RELAY_QUEUE_LENGTH));
+  } else {
+    Serial.println("[BLADE RELAY] ⚠️ Backup interno do Blade indisponível.");
   }
 
   // 2. Inicializa BLE
@@ -1664,6 +2646,40 @@ static void remusAppBeginImpl() {
     imuTaskHandle = NULL;
     imuOk = false;
     Serial.println("[TASK] ❌ Falha ao criar Task IMU.");
+  }
+
+  if (pcLiveImuQueue) {
+    BaseType_t liveTaskCreated = xTaskCreate(
+      pcLiveImuStreamingTask,
+      "pcLiveImu",
+      4096,
+      NULL,
+      2,
+      &pcLiveImuTaskHandle
+    );
+    if (liveTaskCreated == pdPASS) {
+      Serial.println("[TASK] ✅ Stream IMU bruto ao app iniciado (prioridade 2).");
+    } else {
+      pcLiveImuTaskHandle = NULL;
+      Serial.println("[TASK] ⚠️ Stream IMU bruto ao app indisponível; SD permanece ativo.");
+    }
+  }
+
+  if (bladeRelayQueue && remus::hardware.hasBle) {
+    BaseType_t relayTaskCreated = xTaskCreate(
+      bladeRelayClientTask,
+      "bladeRelay",
+      6144,
+      NULL,
+      1,
+      &bladeRelayClientTaskHandle
+    );
+    if (relayTaskCreated == pdPASS) {
+      Serial.println("[TASK] ✅ Cliente Blade/backup interno iniciado (prioridade 1).");
+    } else {
+      bladeRelayClientTaskHandle = NULL;
+      Serial.println("[TASK] ⚠️ Cliente Blade indisponível; RBP2 e app continuam ativos.");
+    }
   }
 
   // 8. Live SPM é apenas preview: prioridade baixa, mas acima da Idle Task.
@@ -1800,7 +2816,7 @@ static void remusAppTickImpl() {
       xSemaphoreTake(recordingStateMutex, portMAX_DELAY);
       if (isWorkoutActive) {
         if (xRingbufferSend(s_recordingRingBuf, &gpsRec, sizeof(gpsRec), 0) == pdTRUE) {
-          incrementCounter(&recordsWritten);
+          incrementCounter(&recordsQueued);
         } else {
           incrementCounter(&ringBufferOverflowCount);
         }
@@ -1818,7 +2834,8 @@ static void remusAppTickImpl() {
     if (!imuOk) {
       setupIMU();
     }
-    if (!sdOk) {
+    if (!sdOk && !(isWorkoutActive &&
+        __atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED))) {
       setupSD();
     }
   }
@@ -1832,8 +2849,12 @@ static void remusAppTickImpl() {
     for (int b = 0; b < 2; b++) {
       uint8_t* pData = (uint8_t*)xRingbufferReceiveUpTo(s_recordingRingBuf, &rxSize, 0, 4096);
       if (pData != NULL && rxSize > 0) {
-        logFile.write(pData, rxSize);
+        const bool persisted = writeRecordingBytes(pData, rxSize);
         vRingbufferReturnItem(s_recordingRingBuf, pData);
+        if (!persisted) {
+          abortRecordingAfterStorageFailure(rxSize);
+          break;
+        }
         if (rxSize < 4096) break;
       } else {
         break;
@@ -1841,10 +2862,20 @@ static void remusAppTickImpl() {
     }
   }
 
+  // O loopTask continua sendo o único escritor no MicroSD. Pacotes recebidos
+  // pelo callback BLE entram apenas na fila; a persistência do sidecar ocorre
+  // aqui, depois do RBP2 principal e com orçamento limitado por iteração.
+  if (bladeRelayQueue &&
+      (isWorkoutActive ||
+       __atomic_load_n(&bladeCalibrationRequested, __ATOMIC_RELAXED))) {
+    processBladeRelayStorage(8);
+  }
+
   // Flush periódico longo (apenas a cada 60s) para garantir integridade FAT em treinos longos
   if (sdOk && isWorkoutActive && logFile && (now - lastFlush >= 60000)) {
     lastFlush = now;
     logFile.flush();
+    for (File& file : bladeRelayFiles) if (file) file.flush();
   }
 
   // --- PAINEL SERIAL E BROADCAST BLE DE TELEMETRIA AO VIVO (1 Hz) ---
@@ -1858,12 +2889,31 @@ static void remusAppTickImpl() {
     telemetryGx = gx; telemetryGy = gy; telemetryGz = gz;
     telemetrySpm = liveSpm;
     portEXIT_CRITICAL(&telemetryMux);
-    const unsigned long writtenSnapshot = readCounter(&recordsWritten);
+    const unsigned long writtenSnapshot = readCounter(&recordsPersisted);
+    const unsigned long queuedSnapshot = readCounter(&recordsQueued);
     const unsigned long gapSnapshot = readCounter(&imuGapCount);
     const unsigned long maxIntervalSnapshot = readCounter(&maxImuGapMs);
     const unsigned long overflowSnapshot = readCounter(&ringBufferOverflowCount);
     const unsigned long readFailureSnapshot = readCounter(&imuReadFailureCount);
     const unsigned long spmPreviewDropSnapshot = readCounter(&liveSpmQueueDropCount);
+    bool anyBladeConnected = false;
+    unsigned long bladeNotifications = 0;
+    unsigned long bladePacketsPersisted = 0;
+    unsigned long bladeQueueDrops = 0;
+    unsigned long bladeWriteFailures = 0;
+    unsigned long bladeLiveDrops = 0;
+    bool anyBladeStorageFault = false;
+    for (BladeChannel& channel : bladeChannels) {
+      anyBladeConnected = anyBladeConnected ||
+        __atomic_load_n(&channel.connected, __ATOMIC_RELAXED);
+      bladeNotifications += readCounter(&channel.notificationsReceived);
+      bladePacketsPersisted += readCounter(&channel.packetsPersisted);
+      bladeQueueDrops += readCounter(&channel.queueDropCount);
+      bladeWriteFailures += readCounter(&channel.writeFailureCount);
+      bladeLiveDrops += readCounter(&channel.liveDropCount);
+      anyBladeStorageFault = anyBladeStorageFault ||
+        __atomic_load_n(&channel.storageFault, __ATOMIC_RELAXED);
+    }
     bool hasFix = isGpsFixValid();
     int satsInUse = hasFix ? gpsDevice.satellitesInUse() : 0;
     int satsInView = max(satsInUse, gpsDevice.satellitesInView());
@@ -1879,13 +2929,14 @@ static void remusAppTickImpl() {
 
     // 1. Transmissão BLE (notifica o app com telemetria ao vivo a 1 Hz)
     if (bleConnected && pCharacteristic) {
-      char bleBuf[320];
+      notifyBladeRoster();
+      char bleBuf[400];
       char satsStr[32];
       snprintf(satsStr, sizeof(satsStr), "%d/%d:%d:%.1fm", satsInUse, satsInView, gpsDevice.maxSnr(), accuracyMeters);
 
       unsigned long charsRx = remus::hardware.hasGps ? gpsDevice.charsProcessed() : 0;
       if (hasFix) {
-        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,%.2f,%.5f,%.5f,%u,%lu",
+        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,%.2f,%.5f,%.5f,%u,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%d,%lu",
           (unsigned long)(now_us / 1000), telemetryAx, telemetryAy, telemetryAz, telemetryGx, telemetryGy, telemetryGz,
           gpsDevice.latitude(), gpsDevice.longitude(), gpsDevice.speedKmph(),
           satsStr, writtenSnapshot, charsRx, telemetrySpm,
@@ -1894,14 +2945,24 @@ static void remusAppTickImpl() {
           gpsDevice.speedAccuracyCmPerSecond() / 100.0f,
           gpsDevice.courseDegreesE5() / 100000.0f,
           gpsDevice.courseAccuracyDegreesE5() / 100000.0f,
-          gpsDevice.fixType(), (unsigned long)gpsDevice.gpsTimeOfWeekMs());
+          gpsDevice.fixType(), (unsigned long)gpsDevice.gpsTimeOfWeekMs(),
+          queuedSnapshot, readCounter(&storageWriteFailureCount),
+          readCounter(&pcLiveQueueDropCount),
+          anyBladeConnected ? 1 : 0,
+          bladeNotifications, bladePacketsPersisted, bladeQueueDrops,
+          bladeWriteFailures, anyBladeStorageFault ? 1 : 0, bladeLiveDrops);
       } else {
-        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,,,,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,,,,%u,%lu",
+        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,,,,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,,,,%u,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%d,%lu",
           (unsigned long)(now_us / 1000), telemetryAx, telemetryAy, telemetryAz, telemetryGx, telemetryGy, telemetryGz,
           satsStr, writtenSnapshot, charsRx, telemetrySpm,
           imuOk ? 1 : 0, sdOk ? 1 : 0, gapSnapshot, maxIntervalSnapshot,
           overflowSnapshot, readFailureSnapshot,
-          gpsDevice.fixType(), (unsigned long)gpsDevice.gpsTimeOfWeekMs());
+          gpsDevice.fixType(), (unsigned long)gpsDevice.gpsTimeOfWeekMs(),
+          queuedSnapshot, readCounter(&storageWriteFailureCount),
+          readCounter(&pcLiveQueueDropCount),
+          anyBladeConnected ? 1 : 0,
+          bladeNotifications, bladePacketsPersisted, bladeQueueDrops,
+          bladeWriteFailures, anyBladeStorageFault ? 1 : 0, bladeLiveDrops);
       }
       pCharacteristic->setValue(bleBuf);
       pCharacteristic->notify();
@@ -1923,9 +2984,11 @@ static void remusAppTickImpl() {
 
     if (sdOk) {
       if (isWorkoutActive) {
-        Serial.printf("| SD: [Gravando: %s (%lu reg)] ", currentSessionFileName, writtenSnapshot);
+        Serial.printf("| SD: [Gravando: %s (%lu/%lu persistidos/fila)] ",
+          currentSessionFileName, writtenSnapshot, queuedSnapshot);
       } else if (writtenSnapshot > 0) {
-        Serial.printf("| SD: [Finalizado: %s (%lu reg)] ", currentSessionFileName, writtenSnapshot);
+        Serial.printf("| SD: [Finalizado: %s (%lu/%lu persistidos/fila)] ",
+          currentSessionFileName, writtenSnapshot, queuedSnapshot);
       } else {
         Serial.print("| SD: [Standby] ");
       }

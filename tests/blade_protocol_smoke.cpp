@@ -6,6 +6,9 @@
 #include "remus/core/BladeProtocol.hpp"
 
 int main() {
+  uint8_t u64Bytes[8]{};
+  remus::blade::protocol::writeU64(u64Bytes, 0x0123456789ABCDEFULL);
+  assert(remus::blade::protocol::readU64(u64Bytes) == 0x0123456789ABCDEFULL);
   namespace protocol = remus::blade::protocol;
   std::array<protocol::RawImuFrame, 2> samples{};
   samples[0] = {41, 123456789ULL, -1, 2, -3, 4, -5, 6, 0};
@@ -30,6 +33,18 @@ int main() {
   assert(fragment[1] == static_cast<uint8_t>(protocol::MessageType::Fragment));
   assert(fragment[7] == 2);
   assert(fragment[8] == 20);
+
+  std::array<uint8_t, protocol::kMaxRelayedPacketSize> relayed{};
+  const size_t relayedLength = protocol::encodeRelayedPacket(
+      relayed.data(), relayed.size(), 0x11223344, 9876,
+      bytes.data(), length);
+  assert(relayedLength == protocol::kRelayHeaderSize + length + protocol::kRelayCrcSize);
+  assert(relayed[1] == static_cast<uint8_t>(protocol::MessageType::RelayedPacket));
+  assert(protocol::readU32(relayed.data() + 2) == 0x11223344);
+  assert(protocol::readU32(relayed.data() + 6) == 9876);
+  assert(protocol::readU16(relayed.data() + 10) == length);
+  assert(protocol::readU32(relayed.data() + relayedLength - 4) ==
+         protocol::crc32(relayed.data(), relayedLength - 4));
 
   std::cout << "blade_protocol_smoke OK\n";
 }

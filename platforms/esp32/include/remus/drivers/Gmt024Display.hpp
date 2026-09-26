@@ -21,6 +21,9 @@ struct DisplayTelemetry {
   uint8_t satellitesInUse = 0;
   uint8_t satellitesInView = 0;
   unsigned long recordsWritten = 0;
+  bool bladeAlignmentAvailable = false;
+  float relativeEquipmentAlignmentDegrees = 0.0f;
+  uint8_t orientationQuality = 0;
 };
 
 class Gmt024Display {
@@ -45,6 +48,7 @@ private:
                           const char* value, uint16_t indicatorColor,
                           uint8_t textSize, char* cache, size_t cacheSize,
                           bool force);
+  void drawBladeAlignment(const DisplayTelemetry& telemetry, bool force);
 
   Arduino_SWSPI bus_;
   Arduino_ST7789 tft_;
@@ -57,6 +61,8 @@ private:
   char spmCache_[16]{};
   char paceCache_[16]{};
   char healthCache_[64]{};
+  bool alignmentMode_ = false;
+  float alignmentDegreesCache_ = 1000.0f;
 };
 
 }  // namespace remus::drivers

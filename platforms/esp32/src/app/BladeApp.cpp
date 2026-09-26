@@ -24,7 +24,7 @@ namespace {
 
 namespace protocol = remus::blade::protocol;
 
-constexpr char kFirmwareVersion[] = "1.0.0";
+constexpr char kFirmwareVersion[] = "1.1.0";
 constexpr char kServiceUuid[] = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 constexpr char kDeviceInfoUuid[] = "beb5483f-36e1-4688-b7f5-ea07361b26a8";
 constexpr char kControlUuid[] = "beb54840-36e1-4688-b7f5-ea07361b26a8";
@@ -83,8 +83,8 @@ void buildIdentity() {
 
   const uint32_t shortHash = protocol::crc32(
       reinterpret_cast<const uint8_t*>(deviceSerial.c_str()), deviceSerial.length());
-  snprintf(deviceName, sizeof(deviceName), "REMUS-BLD-%04lX",
-           static_cast<unsigned long>(shortHash & 0xFFFFU));
+  snprintf(deviceName, sizeof(deviceName), "REMUS-BLD-%08lX",
+           static_cast<unsigned long>(shortHash));
 }
 
 size_t encodeDeviceInfo(uint8_t* out, size_t capacity) {
@@ -256,6 +256,8 @@ void setupBle() {
       reinterpret_cast<const uint8_t*>(deviceSerial.c_str()), deviceSerial.length());
   manufacturerData.push_back(static_cast<char>(shortHash & 0xFF));
   manufacturerData.push_back(static_cast<char>((shortHash >> 8) & 0xFF));
+  manufacturerData.push_back(static_cast<char>((shortHash >> 16) & 0xFF));
+  manufacturerData.push_back(static_cast<char>((shortHash >> 24) & 0xFF));
   advertisementData.setManufacturerData(manufacturerData);
   advertising->setAdvertisementData(advertisementData);
 
