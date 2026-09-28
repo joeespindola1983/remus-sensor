@@ -52,7 +52,12 @@
 #define BLADE_CONTROL_CHARACTERISTIC_UUID "beb54840-36e1-4688-b7f5-ea07361b26a8"
 #define BLADE_RELAY_CHARACTERISTIC_UUID "beb54844-36e1-4688-b7f5-ea07361b26a8"
 #define BLADE_CLOCK_SYNC_CHARACTERISTIC_UUID "beb54843-36e1-4688-b7f5-ea07361b26a8"
-#define REMUS_FIRMWARE_VERSION "1.3.0"
+#define REMUS_FIRMWARE_VERSION "1.3.1"
+
+#ifndef REMUS_ENABLE_BLADE_RELAY
+#define REMUS_ENABLE_BLADE_RELAY 1
+#endif
+constexpr bool kBladeRelayEnabled = REMUS_ENABLE_BLADE_RELAY != 0;
 
 // Binary session records live in remus-core and are shared with Prototype 2.
 using RemusFileHeader = remus::session::FileHeader;
@@ -128,6 +133,9 @@ volatile unsigned long recordsPersisted = 0;
 volatile unsigned long bytesPersisted = 0;
 volatile unsigned long storageWriteFailureCount = 0;
 volatile bool recordingStorageFault = false;
+// Local persistence is an optional sink. A workout can remain active and send
+// its full-rate IMU stream over BLE when the MicroSD module/card is absent.
+volatile bool localPersistenceActive = false;
 volatile bool isWorkoutActive = false;
 volatile bool bladeCalibrationRequested = false;
 volatile unsigned long bladeCalibrationRequestedAtMs = 0;
@@ -387,6 +395,7 @@ void abortRecordingAfterStorageFailure(size_t attemptedBytes) {
     logFile.flush();
     logFile.close();
   }
+  __atomic_store_n(&localPersistenceActive, false, __ATOMIC_RELAXED);
   sdOk = false;
   updateDisplay(true);
   Serial.printf(
@@ -1052,11 +1061,13 @@ class RemusCharacteristicCallbacks : public BLECharacteristicCallbacks {
         handleGpsAiding(rxValue);
       } else if (rxValue.startsWith("BLADE_SLOT,") ||
                  rxValue.equalsIgnoreCase("BLADE_SLOTS?")) {
-        handleBladeSlotCommand(rxValue);
+        if (kBladeRelayEnabled) handleBladeSlotCommand(rxValue);
       } else if (rxValue.equalsIgnoreCase("BLADE_CALIBRATE")) {
-        __atomic_store_n(&bladeCalibrationRequestedAtMs, millis(), __ATOMIC_RELAXED);
-        __atomic_store_n(&bladeCalibrationRequested, true, __ATOMIC_RELAXED);
-        notifyBladeSlotState("CALIBRATION_PENDING");
+        if (kBladeRelayEnabled) {
+          __atomic_store_n(&bladeCalibrationRequestedAtMs, millis(), __ATOMIC_RELAXED);
+          __atomic_store_n(&bladeCalibrationRequested, true, __ATOMIC_RELAXED);
+          notifyBladeSlotState("CALIBRATION_PENDING");
+        }
       } else if (rxValue.equalsIgnoreCase("START") || rxValue.startsWith("START")) {
         queueControlCommand(ControlCommandType::Start);
       } else if (rxValue.equalsIgnoreCase("STOP") || rxValue.startsWith("STOP")) {
@@ -1115,11 +1126,13 @@ void setupBLE() {
                     );
   pImuStreamCharacteristic->addDescriptor(new BLE2902());
 
-  pBladeRelayCharacteristic = pService->createCharacteristic(
-                      BLADE_RELAY_CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_NOTIFY
-                    );
-  pBladeRelayCharacteristic->addDescriptor(new BLE2902());
+  if (kBladeRelayEnabled) {
+    pBladeRelayCharacteristic = pService->createCharacteristic(
+                        BLADE_RELAY_CHARACTERISTIC_UUID,
+                        BLECharacteristic::PROPERTY_NOTIFY
+                      );
+    pBladeRelayCharacteristic->addDescriptor(new BLE2902());
+  }
 
   pService->start();
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
@@ -1274,21 +1287,13 @@ void updateDisplay(bool force) {
 }
 
 void startWorkoutRecording() {
-  if (!sdOk) {
-    Serial.println("[SD] 🔄 MicroSD offline. Tentando reinicializar antes de gravar...");
-    setupSD();
-  }
-  if (!sdOk) {
-    Serial.println("[SD] ⚠️ Não é possível iniciar gravação: MicroSD offline.");
-    return;
-  }
   if (isWorkoutActive) {
-    Serial.println("[SD] ⚠️ Gravação do workout já está ativa.");
+    Serial.println("[WORKOUT] ⚠️ Workout já está ativo.");
     return;
   }
 
-  if (!s_recordingRingBuf || !recordingStateMutex) {
-    Serial.println("[BUF] ❌ Infraestrutura de gravação indisponível.");
+  if (!recordingStateMutex) {
+    Serial.println("[BUF] ❌ Infraestrutura de controle do workout indisponível.");
     return;
   }
 
@@ -1312,23 +1317,17 @@ void startWorkoutRecording() {
   }
 
   // Gera nome único para o novo arquivo (ex: /remus_sensor_1A2B3C4D.bin) sem apagar dados anteriores
-  closeBladeRelayFile();
+  if (kBladeRelayEnabled) closeBladeRelayFile();
   currentSessionId = esp_random();
   currentSessionStartedAtMs = millis();
   snprintf(currentSessionFileName, sizeof(currentSessionFileName), "/remus_sensor_%08X.bin", currentSessionId);
-  for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
-    snprintf(currentBladeRelayFileNames[index], sizeof(currentBladeRelayFileNames[index]),
-      "/remus_blade_%08X_%c_%08lX.rbr", currentSessionId,
-      index == 0 ? 'L' : 'R',
-      static_cast<unsigned long>(bladeChannels[index].sourceIdentityHash));
-  }
-
-  logFile = SD.open(currentSessionFileName, FILE_WRITE);
-  if (!logFile) {
-    Serial.printf("[SD] ❌ Erro ao criar %s para gravação!\n", currentSessionFileName);
-    isWorkoutActive = false;
-    xSemaphoreGive(recordingStateMutex);
-    return;
+  if (kBladeRelayEnabled) {
+    for (size_t index = 0; index < BLADE_CHANNEL_COUNT; ++index) {
+      snprintf(currentBladeRelayFileNames[index], sizeof(currentBladeRelayFileNames[index]),
+        "/remus_blade_%08X_%c_%08lX.rbr", currentSessionId,
+        index == 0 ? 'L' : 'R',
+        static_cast<unsigned long>(bladeChannels[index].sourceIdentityHash));
+    }
   }
 
   // RBP2 keeps the RBP1 IMU/SPM layout and adds coherent receiver-native GNSS.
@@ -1344,6 +1343,7 @@ void startWorkoutRecording() {
   __atomic_store_n(&bytesPersisted, 0UL, __ATOMIC_RELAXED);
   __atomic_store_n(&storageWriteFailureCount, 0UL, __ATOMIC_RELAXED);
   __atomic_store_n(&recordingStorageFault, false, __ATOMIC_RELAXED);
+  __atomic_store_n(&localPersistenceActive, false, __ATOMIC_RELAXED);
   __atomic_store_n(&pcLiveSampleSequence, 0U, __ATOMIC_RELAXED);
   __atomic_store_n(&pcLiveBatchSequence, 0U, __ATOMIC_RELAXED);
   __atomic_store_n(&pcLiveQueueDropCount, 0UL, __ATOMIC_RELAXED);
@@ -1359,18 +1359,29 @@ void startWorkoutRecording() {
   }
   persistedRecordBytesRemaining = 0;
   if (pcLiveImuQueue) xQueueReset(pcLiveImuQueue);
-  if (bladeRelayQueue) xQueueReset(bladeRelayQueue);
+  if (kBladeRelayEnabled && bladeRelayQueue) xQueueReset(bladeRelayQueue);
 
-  const size_t headerBytes = logFile.write((const uint8_t*)&header, sizeof(header));
-  if (headerBytes != sizeof(header)) {
-    incrementCounter(&storageWriteFailureCount);
-    __atomic_store_n(&recordingStorageFault, true, __ATOMIC_RELAXED);
-    logFile.close();
-    sdOk = false;
-    Serial.printf("[SD] ❌ Cabeçalho incompleto: %u/%u bytes. Somente o stream ao app continuará.\n",
-      static_cast<unsigned int>(headerBytes), static_cast<unsigned int>(sizeof(header)));
-  } else {
-    logFile.flush();
+  if (sdOk) {
+    logFile = SD.open(currentSessionFileName, FILE_WRITE);
+    if (!logFile) {
+      incrementCounter(&storageWriteFailureCount);
+      __atomic_store_n(&recordingStorageFault, true, __ATOMIC_RELAXED);
+      sdOk = false;
+      Serial.println("[SD] ⚠️ Persistência local indisponível; workout continuará via BLE.");
+    } else {
+      const size_t headerBytes = logFile.write((const uint8_t*)&header, sizeof(header));
+      if (headerBytes != sizeof(header)) {
+        incrementCounter(&storageWriteFailureCount);
+        __atomic_store_n(&recordingStorageFault, true, __ATOMIC_RELAXED);
+        logFile.close();
+        sdOk = false;
+        Serial.printf("[SD] ⚠️ Cabeçalho incompleto: %u/%u bytes; workout continuará via BLE.\n",
+          static_cast<unsigned int>(headerBytes), static_cast<unsigned int>(sizeof(header)));
+      } else {
+        logFile.flush();
+        __atomic_store_n(&localPersistenceActive, true, __ATOMIC_RELAXED);
+      }
+    }
   }
 
   __atomic_store_n(&imuGapCount, 0UL, __ATOMIC_RELAXED);
@@ -1401,8 +1412,8 @@ void startWorkoutRecording() {
   __atomic_store_n(&liveSpmPreviewEnabled, true, __ATOMIC_RELAXED);
   xSemaphoreGive(recordingStateMutex);
   updateDisplay();
-  if (__atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED)) {
-    Serial.println("[BLE] 🔴 Workout iniciado em modo degradado: IMU bruto somente no app.");
+  if (!__atomic_load_n(&localPersistenceActive, __ATOMIC_RELAXED)) {
+    Serial.println("[BLE] 🔴 Workout iniciado via BLE; persistência local opcional inativa.");
   } else {
     Serial.printf("[SD] 🔴 Gravação do Workout INICIADA em binário: %s\n", currentSessionFileName);
   }
@@ -1421,7 +1432,7 @@ void stopWorkoutRecording() {
   portEXIT_CRITICAL(&telemetryMux);
 
   if (!isWorkoutActive) {
-    Serial.println("[SD] ⚠️ Nenhuma gravação de workout ativa para parar.");
+    Serial.println("[WORKOUT] ⚠️ Nenhum workout ativo para parar.");
     return;
   }
 
@@ -1430,6 +1441,9 @@ void stopWorkoutRecording() {
   // proprietário durante escrita, flush e fechamento.
   xSemaphoreTake(recordingStateMutex, portMAX_DELAY);
   isWorkoutActive = false;
+  const bool hadLocalPersistence =
+    __atomic_load_n(&localPersistenceActive, __ATOMIC_RELAXED);
+  __atomic_store_n(&localPersistenceActive, false, __ATOMIC_RELAXED);
   xSemaphoreGive(recordingStateMutex);
 
   if (logFile) {
@@ -1453,14 +1467,20 @@ void stopWorkoutRecording() {
     logFile.flush();
     logFile.close();
   }
-  closeBladeRelayFile();
+  if (kBladeRelayEnabled) closeBladeRelayFile();
 
   // Persist only the latest GPS recovery snapshot after the time-sensitive
   // recording path has stopped. Repeated NVS commits during capture caused
   // long IMU gaps and invalidated the 15-second cadence windows.
   persistLatestGpsFix();
   updateDisplay();
-  const bool complete = !__atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED) &&
+  const bool storageFault =
+    __atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED);
+  if (!hadLocalPersistence && !storageFault) {
+    Serial.println("[BLE] ⏹️ Workout finalizado; nenhuma cópia local foi solicitada/disponibilizada.");
+    return;
+  }
+  const bool complete = !storageFault &&
     persistedRecordBytesRemaining == 0;
   Serial.printf("[SD] %s Arquivo '%s' preservado. Fila=%lu, persistidos=%lu, bytes=%lu, overflows=%lu, falhas=%lu\n",
     complete ? "⏹️ Gravação FINALIZADA!" : "⚠️ Gravação INTERROMPIDA!",
@@ -2272,7 +2292,8 @@ void imuSamplingTask(void* pvParameters) {
     imuRec.gy = sample.rawGy;
     imuRec.gz = sample.rawGz;
 
-    if (!__atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED) && s_recordingRingBuf) {
+    if (__atomic_load_n(&localPersistenceActive, __ATOMIC_RELAXED) &&
+        s_recordingRingBuf) {
       if (xRingbufferSend(s_recordingRingBuf, &imuRec, sizeof(imuRec), 0) == pdTRUE) {
         incrementCounter(&recordsQueued);
       } else {
@@ -2513,7 +2534,7 @@ void liveSpmProcessingTask(void* pvParameters) {
       // mas não gravamos outro 0x03: análise offline continua distinguindo uma
       // medição aceita de um simples hold de apresentação.
       if (!spmRes.held && recordingStateMutex && s_recordingRingBuf &&
-          !__atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED)) {
+          __atomic_load_n(&localPersistenceActive, __ATOMIC_RELAXED)) {
         xSemaphoreTake(recordingStateMutex, portMAX_DELAY);
         if (isWorkoutActive && sample.generation == __atomic_load_n(&liveSpmGeneration, __ATOMIC_RELAXED)) {
           RemusSpmRecord spmRec;
@@ -2540,7 +2561,7 @@ void liveSpmProcessingTask(void* pvParameters) {
       // unavailable/ambiguous estimate. Emit exactly on the non-zero -> quiet
       // transition; subsequent quiet windows see liveSpm already at zero.
       if (stoppedFromActiveCadence && recordingStateMutex && s_recordingRingBuf &&
-          !__atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED)) {
+          __atomic_load_n(&localPersistenceActive, __ATOMIC_RELAXED)) {
         RemusSpmRecord spmRec{};
         spmRec.type = 0x03;
         spmRec.timestamp_ms = sample.timestamp_ms;
@@ -2581,17 +2602,19 @@ static void remusAppBeginImpl() {
   Serial.printf("       Firmware %s | Session format RBP2\n", REMUS_FIRMWARE_VERSION);
   Serial.println("=========================================================");
   printHardwareProfile();
-  loadBladeSlots();
+  if (kBladeRelayEnabled) loadBladeSlots();
 
   // 1. Inicializa sincronização, comandos e RingBuffer de gravação.
   recordingStateMutex = xSemaphoreCreateMutex();
-  bladeOrientationMutex = xSemaphoreCreateMutex();
+  if (kBladeRelayEnabled) bladeOrientationMutex = xSemaphoreCreateMutex();
   controlCommandQueue = xQueueCreate(4, sizeof(ControlCommand));
   s_recordingRingBuf = xRingbufferCreate(RECORDING_RING_BUFFER_SIZE, RINGBUF_TYPE_BYTEBUF);
   liveSpmSampleQueue = xQueueCreate(LIVE_SPM_QUEUE_LENGTH, sizeof(LiveSpmInputSample));
   pcLiveImuQueue = xQueueCreate(
     PC_LIVE_IMU_QUEUE_LENGTH, sizeof(remus::blade::protocol::RawImuFrame));
-  bladeRelayQueue = xQueueCreate(BLADE_RELAY_QUEUE_LENGTH, sizeof(BladeRelayPacket));
+  if (kBladeRelayEnabled) {
+    bladeRelayQueue = xQueueCreate(BLADE_RELAY_QUEUE_LENGTH, sizeof(BladeRelayPacket));
+  }
   if (s_recordingRingBuf && recordingStateMutex && controlCommandQueue) {
     Serial.printf("[BUF] ✅ Pipeline RAM alocado com sucesso (%u bytes)\n", (unsigned int)RECORDING_RING_BUFFER_SIZE);
   } else {
@@ -2608,7 +2631,9 @@ static void remusAppBeginImpl() {
   } else {
     Serial.println("[BLE] ⚠️ Stream bruto ao app indisponível; gravação local continua operacional.");
   }
-  if (bladeRelayQueue) {
+  if (!kBladeRelayEnabled) {
+    Serial.println("[BLADE RELAY] ⏸️ Desabilitado por configuração; Blades conectam direto ao iPhone.");
+  } else if (bladeRelayQueue) {
     Serial.printf("[BLADE RELAY] ✅ Fila de backup criada (%u notificações).\n",
       static_cast<unsigned int>(BLADE_RELAY_QUEUE_LENGTH));
   } else {
@@ -2665,7 +2690,7 @@ static void remusAppBeginImpl() {
     }
   }
 
-  if (bladeRelayQueue && remus::hardware.hasBle) {
+  if (kBladeRelayEnabled && bladeRelayQueue && remus::hardware.hasBle) {
     BaseType_t relayTaskCreated = xTaskCreate(
       bladeRelayClientTask,
       "bladeRelay",
@@ -2794,7 +2819,8 @@ static void remusAppTickImpl() {
 
     // O GPS usa o mesmo mutex da task do IMU, preservando registros inteiros e
     // garantindo que STOP não drene a fila durante um enqueue em voo.
-    if (sdOk && isWorkoutActive && logFile && s_recordingRingBuf && recordingStateMutex) {
+    if (__atomic_load_n(&localPersistenceActive, __ATOMIC_RELAXED) &&
+        isWorkoutActive && logFile && s_recordingRingBuf && recordingStateMutex) {
       RemusGpsV2Record gpsRec{};
       gpsRec.type = 0x04;
       gpsRec.timestamp_ms = gpsDevice.navigationReceivedAtMs();
@@ -2827,17 +2853,13 @@ static void remusAppTickImpl() {
 
   unsigned long now = millis();
 
-  // --- AUTO-RECUPERAÇÃO DE HARDWARE (IMU / MicroSD) a cada 5s ---
+  // --- AUTO-RECUPERAÇÃO DO IMU a cada 5s ---
+  // O MicroSD é opcional e é sondado uma vez no boot. Ausência de cartão
+  // ou do próprio módulo não gera novas tentativas nem compete com BLE/IMU.
   static unsigned long lastHardwareRetry = 0;
-  if (!isTransferActive && (!sdOk || !imuOk) && (now - lastHardwareRetry >= 5000)) {
+  if (!isTransferActive && !imuOk && (now - lastHardwareRetry >= 5000)) {
     lastHardwareRetry = now;
-    if (!imuOk) {
-      setupIMU();
-    }
-    if (!sdOk && !(isWorkoutActive &&
-        __atomic_load_n(&recordingStorageFault, __ATOMIC_RELAXED))) {
-      setupSD();
-    }
+    setupIMU();
   }
 
   // --- DESPEJO CONTÍNUO DO RINGBUFFER NO MICROSD (SPI) ---
@@ -2865,7 +2887,7 @@ static void remusAppTickImpl() {
   // O loopTask continua sendo o único escritor no MicroSD. Pacotes recebidos
   // pelo callback BLE entram apenas na fila; a persistência do sidecar ocorre
   // aqui, depois do RBP2 principal e com orçamento limitado por iteração.
-  if (bladeRelayQueue &&
+  if (kBladeRelayEnabled && bladeRelayQueue &&
       (isWorkoutActive ||
        __atomic_load_n(&bladeCalibrationRequested, __ATOMIC_RELAXED))) {
     processBladeRelayStorage(8);
@@ -2929,7 +2951,7 @@ static void remusAppTickImpl() {
 
     // 1. Transmissão BLE (notifica o app com telemetria ao vivo a 1 Hz)
     if (bleConnected && pCharacteristic) {
-      notifyBladeRoster();
+      if (kBladeRelayEnabled) notifyBladeRoster();
       char bleBuf[400];
       char satsStr[32];
       snprintf(satsStr, sizeof(satsStr), "%d/%d:%d:%.1fm", satsInUse, satsInView, gpsDevice.maxSnr(), accuracyMeters);

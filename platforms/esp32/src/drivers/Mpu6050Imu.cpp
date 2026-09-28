@@ -4,8 +4,9 @@
 
 namespace remus::drivers {
 
-Mpu6050Imu::Mpu6050Imu(TwoWire& wire, int sda, int scl, uint16_t rateHz)
-    : wire_(wire), sda_(sda), scl_(scl), rateHz_(rateHz) {}
+Mpu6050Imu::Mpu6050Imu(TwoWire& wire, int sda, int scl, uint16_t rateHz,
+                       Mpu6050GyroRange gyroRange)
+    : wire_(wire), sda_(sda), scl_(scl), rateHz_(rateHz), gyroRange_(gyroRange) {}
 
 bool Mpu6050Imu::configureAddress(uint8_t addr) {
   wire_.beginTransmission(addr);
@@ -24,7 +25,7 @@ bool Mpu6050Imu::configureAddress(uint8_t addr) {
 
   wire_.beginTransmission(addr);
   wire_.write(0x1B);
-  wire_.write(0x08); // ±500 dps
+  wire_.write(gyroRange_ == Mpu6050GyroRange::Dps1000 ? 0x10 : 0x08);
   if (wire_.endTransmission(true) != 0) return false;
 
   wire_.beginTransmission(addr);
@@ -92,9 +93,10 @@ bool Mpu6050Imu::read(hal::ImuSample& sample) {
   sample.accelX = sample.rawAx / 4096.0f;
   sample.accelY = sample.rawAy / 4096.0f;
   sample.accelZ = sample.rawAz / 4096.0f;
-  sample.gyroX = sample.rawGx / 65.5f;
-  sample.gyroY = sample.rawGy / 65.5f;
-  sample.gyroZ = sample.rawGz / 65.5f;
+  const float gyroLsbPerDps = gyroRange_ == Mpu6050GyroRange::Dps1000 ? 32.8f : 65.5f;
+  sample.gyroX = sample.rawGx / gyroLsbPerDps;
+  sample.gyroY = sample.rawGy / gyroLsbPerDps;
+  sample.gyroZ = sample.rawGz / gyroLsbPerDps;
   return true;
 }
 

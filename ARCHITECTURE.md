@@ -43,11 +43,13 @@ clock with retained uncertainty. Notification arrival order is not clock
 alignment. With the current six-axis MPU-6050, yaw remains drift-prone and the
 result is relative/calibrated orientation, not absolute heading.
 
-The current ESP32 application still owns one Blade BLE client. Converting it to
-two sources requires two explicit channel states (identity, client,
-characteristics, queue, sidecar, clock mapping and estimator). This transport
-change must not multiplex two source identities into the existing singleton
-`RBR1` state.
+The relay implementation has explicit left/right channel state, but the current
+field-development Computer build sets `REMUS_ENABLE_BLADE_RELAY=0`. In that
+profile the Computer does not scan, connect, command, persist, relay or orient
+Blade sources; the iPhone owns two direct Blade connections. The Computer keeps
+its own RBP2 and app stream. The relay code remains build-selectable for
+controlled rollback and must never be active simultaneously with direct mobile
+capture of the same Blade.
 
 ## Why Prototype 2 is not a PlatformIO environment
 

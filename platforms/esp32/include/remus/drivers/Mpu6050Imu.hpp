@@ -5,9 +5,15 @@
 
 namespace remus::drivers {
 
+enum class Mpu6050GyroRange : uint16_t {
+  Dps500 = 500,
+  Dps1000 = 1000,
+};
+
 class Mpu6050Imu final : public hal::IImu {
 public:
-  Mpu6050Imu(TwoWire& wire, int sda, int scl, uint16_t rateHz = 200);
+  Mpu6050Imu(TwoWire& wire, int sda, int scl, uint16_t rateHz = 200,
+             Mpu6050GyroRange gyroRange = Mpu6050GyroRange::Dps500);
 
   bool begin() override;
   bool read(hal::ImuSample& sample) override;
@@ -22,6 +28,7 @@ private:
   int sda_;
   int scl_;
   uint16_t rateHz_;
+  Mpu6050GyroRange gyroRange_;
   uint8_t address_ = 0x68;
   bool healthy_ = false;
 };

@@ -153,6 +153,12 @@ than 185 bytes. Sampling never calls the BLE stack. Stable device serials are
 derived once from the ESP32 identity and persisted in NVS; the app can assign
 human aliases such as `Blade 01` without changing that identity.
 
+On Remus Computer, MicroSD is an optional local-persistence sink. `START`
+activates the workout and full-rate BLE stream even when the card or the whole
+MicroSD module is absent. Firmware probes storage once during boot and does not
+retry or emit repeated mount failures during normal BLE operation. If a card is
+available, the RBP2 file is written as an additional recovery copy.
+
 This beta intentionally makes no battery, onboard-storage, GNSS or
 store-and-forward claim. Those capabilities require matching hardware and
 evidence before they may be advertised.

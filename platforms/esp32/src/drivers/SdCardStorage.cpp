@@ -89,9 +89,7 @@ bool SdCardStorage::begin() {
     return true;
   }
 
-  Serial.println("[SD] ❌ Falha ao montar MicroSD.");
-  Serial.printf("     Confira GND/alimentação e fiação: SCK=%d MISO=%d MOSI=%d CS=%d\n",
-                sck_, miso_, mosi_, cs_);
+  Serial.println("[SD] ℹ️ MicroSD ausente ou indisponível; armazenamento local opcional desativado.");
   return false;
 }
 

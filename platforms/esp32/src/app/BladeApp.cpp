@@ -24,7 +24,7 @@ namespace {
 
 namespace protocol = remus::blade::protocol;
 
-constexpr char kFirmwareVersion[] = "1.1.0";
+constexpr char kFirmwareVersion[] = "1.2.0";
 constexpr char kServiceUuid[] = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 constexpr char kDeviceInfoUuid[] = "beb5483f-36e1-4688-b7f5-ea07361b26a8";
 constexpr char kControlUuid[] = "beb54840-36e1-4688-b7f5-ea07361b26a8";
@@ -35,7 +35,7 @@ constexpr UBaseType_t kSampleQueueLength = 400;  // Two seconds at 200 Hz.
 
 remus::drivers::Mpu6050Imu imuDevice(
     Wire, remus::hardware.imuPins.sda, remus::hardware.imuPins.scl,
-    remus::hardware.imuRateHz);
+    remus::hardware.imuRateHz, remus::drivers::Mpu6050GyroRange::Dps1000);
 
 Preferences preferences;
 QueueHandle_t sampleQueue = nullptr;
@@ -100,7 +100,7 @@ size_t encodeDeviceInfo(uint8_t* out, size_t capacity) {
   protocol::writeU16(out + 4, 0x0003);  // RAW IMU + live streaming.
   protocol::writeU16(out + 6, remus::hardware.imuRateHz);
   out[8] = 1;  // +/-8 g configuration identifier.
-  out[9] = 1;  // +/-500 dps configuration identifier.
+  out[9] = 2;  // +/-1000 dps configuration identifier.
   out[10] = static_cast<uint8_t>(serialLength);
   memcpy(out + 11, deviceSerial.c_str(), serialLength);
   out[11 + serialLength] = static_cast<uint8_t>(firmwareLength);
