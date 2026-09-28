@@ -7,6 +7,7 @@
 namespace remus::blade::protocol {
 
 inline constexpr uint8_t kVersion = 1;
+inline constexpr uint8_t kDeviceFamilyComputer = 1;
 inline constexpr uint8_t kDeviceFamilyBlade = 2;
 inline constexpr uint16_t kNominalSamplePeriodUs = 5000;
 inline constexpr size_t kAxesBytesPerSample = 12;
