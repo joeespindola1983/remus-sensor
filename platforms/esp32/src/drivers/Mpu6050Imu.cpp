@@ -5,8 +5,9 @@
 namespace remus::drivers {
 
 Mpu6050Imu::Mpu6050Imu(TwoWire& wire, int sda, int scl, uint16_t rateHz,
-                       Mpu6050GyroRange gyroRange)
-    : wire_(wire), sda_(sda), scl_(scl), rateHz_(rateHz), gyroRange_(gyroRange) {}
+                       Mpu6050GyroRange gyroRange, Mpu6050AccelRange accelRange)
+    : wire_(wire), sda_(sda), scl_(scl), rateHz_(rateHz), gyroRange_(gyroRange),
+      accelRange_(accelRange) {}
 
 bool Mpu6050Imu::configureAddress(uint8_t addr) {
   wire_.beginTransmission(addr);
@@ -20,12 +21,13 @@ bool Mpu6050Imu::configureAddress(uint8_t addr) {
 
   wire_.beginTransmission(addr);
   wire_.write(0x1C);
-  wire_.write(0x10); // ±8g
+  wire_.write(accelRange_ == Mpu6050AccelRange::G16 ? 0x18 : 0x10);
   if (wire_.endTransmission(true) != 0) return false;
 
   wire_.beginTransmission(addr);
   wire_.write(0x1B);
-  wire_.write(gyroRange_ == Mpu6050GyroRange::Dps1000 ? 0x10 : 0x08);
+  wire_.write(gyroRange_ == Mpu6050GyroRange::Dps2000 ? 0x18 :
+              gyroRange_ == Mpu6050GyroRange::Dps1000 ? 0x10 : 0x08);
   if (wire_.endTransmission(true) != 0) return false;
 
   wire_.beginTransmission(addr);
@@ -90,10 +92,12 @@ bool Mpu6050Imu::read(hal::ImuSample& sample) {
   sample.rawGy = wire_.read() << 8 | wire_.read();
   sample.rawGz = wire_.read() << 8 | wire_.read();
 
-  sample.accelX = sample.rawAx / 4096.0f;
-  sample.accelY = sample.rawAy / 4096.0f;
-  sample.accelZ = sample.rawAz / 4096.0f;
-  const float gyroLsbPerDps = gyroRange_ == Mpu6050GyroRange::Dps1000 ? 32.8f : 65.5f;
+  const float accelLsbPerG = accelRange_ == Mpu6050AccelRange::G16 ? 2048.0f : 4096.0f;
+  sample.accelX = sample.rawAx / accelLsbPerG;
+  sample.accelY = sample.rawAy / accelLsbPerG;
+  sample.accelZ = sample.rawAz / accelLsbPerG;
+  const float gyroLsbPerDps = gyroRange_ == Mpu6050GyroRange::Dps2000 ? 16.4f :
+    gyroRange_ == Mpu6050GyroRange::Dps1000 ? 32.8f : 65.5f;
   sample.gyroX = sample.rawGx / gyroLsbPerDps;
   sample.gyroY = sample.rawGy / gyroLsbPerDps;
   sample.gyroZ = sample.rawGz / gyroLsbPerDps;
