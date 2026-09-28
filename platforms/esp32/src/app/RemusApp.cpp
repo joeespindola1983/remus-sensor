@@ -2594,9 +2594,10 @@ void liveSpmProcessingTask(void* pvParameters) {
         }
         xSemaphoreGive(recordingStateMutex);
       }
-    } else if (spmRes.progress >= 1.0 && spmRes.reason == "recent_quiet") {
-      // Zero significa parada confirmada. Janela fraca, ambígua ou sem dados
-      // não é convertida em zero, nem na UI nem no arquivo.
+    } else if (remus::live::shouldClearLivePresentation(spmRes)) {
+      // Any expired result clears the legacy numeric live presentation so a
+      // previously accepted value cannot remain visible. Only recent_quiet is
+      // persisted as zero evidence; ambiguity and gaps remain unavailable.
       portENTER_CRITICAL(&telemetryMux);
       const bool stoppedFromActiveCadence = liveSpm > 0.0f;
       liveSpm = 0.0f;
@@ -2605,7 +2606,8 @@ void liveSpmProcessingTask(void* pvParameters) {
       // Zero is evidence of a confirmed stop, not a substitute for an
       // unavailable/ambiguous estimate. Emit exactly on the non-zero -> quiet
       // transition; subsequent quiet windows see liveSpm already at zero.
-      if (stoppedFromActiveCadence && recordingStateMutex && s_recordingRingBuf &&
+      if (spmRes.reason == "recent_quiet" && stoppedFromActiveCadence &&
+          recordingStateMutex && s_recordingRingBuf &&
           __atomic_load_n(&localPersistenceActive, __ATOMIC_RELAXED)) {
         RemusSpmRecord spmRec{};
         spmRec.type = 0x03;

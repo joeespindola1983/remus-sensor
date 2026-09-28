@@ -241,7 +241,7 @@ void RemusPiApp::spmLoop() {
         rec.spm_x10 = static_cast<uint16_t>(std::clamp(spm * 10.0f, 0.0f, 65535.0f));
         storage_.writeSpm(rec);
       }
-    } else if (result.progress >= 1.0) {
+    } else if (remus::live::shouldClearLivePresentation(result)) {
       liveSpm_.store(0.0f);
     }
   }
