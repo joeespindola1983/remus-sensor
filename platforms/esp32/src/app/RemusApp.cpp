@@ -52,7 +52,8 @@
 #define BLADE_CONTROL_CHARACTERISTIC_UUID "beb54840-36e1-4688-b7f5-ea07361b26a8"
 #define BLADE_RELAY_CHARACTERISTIC_UUID "beb54844-36e1-4688-b7f5-ea07361b26a8"
 #define BLADE_CLOCK_SYNC_CHARACTERISTIC_UUID "beb54843-36e1-4688-b7f5-ea07361b26a8"
-#define REMUS_FIRMWARE_VERSION "1.3.1"
+#define DEVICE_INFO_CHARACTERISTIC_UUID "beb5483f-36e1-4688-b7f5-ea07361b26a8"
+#define REMUS_FIRMWARE_VERSION "1.4.0"
 
 #ifndef REMUS_ENABLE_BLADE_RELAY
 #define REMUS_ENABLE_BLADE_RELAY 1
@@ -105,6 +106,42 @@ volatile bool bleConnected = false;
 volatile bool bladeRosterDirty = true;
 bool oldBleConnected = false;
 char remusDeviceName[24] = "REMUS-ESP32";
+String remusDeviceSerial;
+
+void buildDeviceIdentity(uint64_t chipid) {
+  Preferences identityPrefs;
+  identityPrefs.begin("remus_device", false);
+  remusDeviceSerial = identityPrefs.getString("serial", "");
+  if (remusDeviceSerial.isEmpty()) {
+    char serial[24];
+    snprintf(serial, sizeof(serial), "RC-D-%012llX",
+             static_cast<unsigned long long>(chipid & 0xFFFFFFFFFFFFULL));
+    remusDeviceSerial = serial;
+    identityPrefs.putString("serial", remusDeviceSerial);
+  }
+  identityPrefs.end();
+}
+
+size_t encodeComputerDeviceInfo(uint8_t* out, size_t capacity) {
+  const size_t serialLength = std::min<size_t>(remusDeviceSerial.length(), 31);
+  constexpr size_t firmwareLength = sizeof(REMUS_FIRMWARE_VERSION) - 1;
+  const size_t required = 12 + serialLength + 1 + firmwareLength;
+  if (!out || capacity < required) return 0;
+  out[0] = 2;  // Device Info schema; IMU packet protocol remains v1.
+  out[1] = remus::blade::protocol::kDeviceFamilyComputer;
+  out[2] = 1;
+  out[3] = 1;
+  remus::blade::protocol::writeU16(out + 4, 0x001F);
+  remus::blade::protocol::writeU16(out + 6, remus::hardware.imuRateHz);
+  out[8] = 1;  // +/-8 g.
+  out[9] = 1;  // +/-500 dps.
+  out[10] = imuDevice.dlpfSetting();
+  out[11] = static_cast<uint8_t>(serialLength);
+  memcpy(out + 12, remusDeviceSerial.c_str(), serialLength);
+  out[12 + serialLength] = static_cast<uint8_t>(firmwareLength);
+  memcpy(out + 13 + serialLength, REMUS_FIRMWARE_VERSION, firmwareLength);
+  return required;
+}
 
 volatile bool imuOk = false;
 bool sdOk = false;
@@ -1100,6 +1137,7 @@ class RemusCharacteristicCallbacks : public BLECharacteristicCallbacks {
 
 void setupBLE() {
   uint64_t chipid = ESP.getEfuseMac();
+  buildDeviceIdentity(chipid);
   snprintf(remusDeviceName, sizeof(remusDeviceName), "REMUS-%s-%04X", remus::hardware.code, (uint16_t)(chipid & 0xFFFF));
 
   Serial.printf("[BLE] Inicializando BLE como '%s'...\n", remusDeviceName);
@@ -1110,6 +1148,13 @@ void setupBLE() {
   pServer->setCallbacks(new RemusBLEServerCallbacks());
 
   BLEService *pService = pServer->createService(SERVICE_UUID);
+  BLECharacteristic* deviceInfoCharacteristic = pService->createCharacteristic(
+                      DEVICE_INFO_CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ
+                    );
+  uint8_t deviceInfo[64]{};
+  const size_t deviceInfoLength = encodeComputerDeviceInfo(deviceInfo, sizeof(deviceInfo));
+  deviceInfoCharacteristic->setValue(deviceInfo, deviceInfoLength);
   pCharacteristic = pService->createCharacteristic(
                       CHARACTERISTIC_UUID,
                       BLECharacteristic::PROPERTY_READ |
