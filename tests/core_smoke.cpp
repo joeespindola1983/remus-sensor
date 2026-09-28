@@ -23,6 +23,19 @@ int main() {
 
   remus::live::LiveSpmEstimator estimator;
   remus::live::Result last;
+  remus::live::Result expired;
+  expired.updated = true;
+  expired.progress = 1.0;
+  expired.available = false;
+  expired.held = false;
+  expired.reason = "recent_weak_periodicity";
+  assert(remus::live::shouldClearLivePresentation(expired));
+  expired.held = true;
+  assert(!remus::live::shouldClearLivePresentation(expired));
+  expired.held = false;
+  expired.available = true;
+  assert(!remus::live::shouldClearLivePresentation(expired));
+
   constexpr double hz = 25.0;
   constexpr double spm = 30.0;
   constexpr double f = spm / 60.0;

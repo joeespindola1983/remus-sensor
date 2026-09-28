@@ -24,6 +24,11 @@ struct Result {
   std::string reason = "collecting_window";
 };
 
+inline bool shouldClearLivePresentation(const Result& result) {
+  return result.updated && result.progress >= 1.0 &&
+      !result.available && !result.held;
+}
+
 // Causal, source-local preview. This deliberately does not replace the
 // evidence-oriented offline engine result stored after capture.
 //
