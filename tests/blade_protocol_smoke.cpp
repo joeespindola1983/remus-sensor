@@ -1,9 +1,148 @@
 #include <array>
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <string>
 
 #include "remus/core/BladeProtocol.hpp"
+
+// Standalone encoder for testing Device Info v2 (replicates BladeApp/RemusApp schemas)
+size_t encodeDeviceInfoV2(uint8_t* out, size_t capacity, uint8_t family,
+                          uint8_t model, uint8_t hardware, uint16_t capabilities,
+                          uint16_t imuRateHz, uint8_t accelRange, uint8_t gyroRange,
+                          uint8_t dlpfSetting, const std::string& serial,
+                          const std::string& firmware) {
+  const size_t serialLength = std::min<size_t>(serial.length(), 31);
+  const size_t firmwareLength = firmware.length();
+  const size_t required = 12 + serialLength + 1 + firmwareLength;
+  if (!out || capacity < required) return 0;
+  out[0] = 2; // version
+  out[1] = family;
+  out[2] = model;
+  out[3] = hardware;
+  remus::blade::protocol::writeU16(out + 4, capabilities);
+  remus::blade::protocol::writeU16(out + 6, imuRateHz);
+  out[8] = accelRange;
+  out[9] = gyroRange;
+  out[10] = dlpfSetting;
+  out[11] = static_cast<uint8_t>(serialLength);
+  std::memcpy(out + 12, serial.c_str(), serialLength);
+  out[12 + serialLength] = static_cast<uint8_t>(firmwareLength);
+  std::memcpy(out + 13 + serialLength, firmware.c_str(), firmwareLength);
+  return required;
+}
+
+void testDeviceInfoV2() {
+  std::array<uint8_t, 128> out{};
+  
+  // 1. Blade Device
+  size_t len = encodeDeviceInfoV2(out.data(), out.size(),
+                                  2, 1, 1, 0x0003, 200, 2, 3, 3,
+                                  "RB-D-001122334455", "1.4.0");
+  assert(len == 12 + 17 + 1 + 5);
+  assert(out[0] == 2);
+  assert(out[1] == 2);
+  assert(out[2] == 1);
+  assert(out[3] == 1);
+  assert(remus::blade::protocol::readU16(out.data() + 4) == 0x0003);
+  assert(remus::blade::protocol::readU16(out.data() + 6) == 200);
+  assert(out[8] == 2);
+  assert(out[9] == 3);
+  assert(out[10] == 3);
+  assert(out[11] == 17);
+  assert(std::string(reinterpret_cast<const char*>(out.data() + 12), 17) == "RB-D-001122334455");
+  assert(out[29] == 5);
+  assert(std::string(reinterpret_cast<const char*>(out.data() + 30), 5) == "1.4.0");
+
+  // 2. Computer Device
+  len = encodeDeviceInfoV2(out.data(), out.size(),
+                           1, 1, 1, 0x001F, 200, 1, 1, 3,
+                           "RC-D-AABBCCDDEEFF", "1.4.0");
+  assert(len == 12 + 17 + 1 + 5);
+  assert(out[0] == 2);
+  assert(out[1] == 1);
+  assert(out[2] == 1);
+  assert(out[3] == 1);
+  assert(remus::blade::protocol::readU16(out.data() + 4) == 0x001F);
+  assert(remus::blade::protocol::readU16(out.data() + 6) == 200);
+  assert(out[8] == 1);
+  assert(out[9] == 1);
+  assert(out[10] == 3);
+  assert(out[11] == 17);
+  assert(std::string(reinterpret_cast<const char*>(out.data() + 12), 17) == "RC-D-AABBCCDDEEFF");
+  assert(out[29] == 5);
+  assert(std::string(reinterpret_cast<const char*>(out.data() + 30), 5) == "1.4.0");
+}
+
+void testClockSyncCodec() {
+  // Request
+  std::array<uint8_t, 14> req{};
+  req[0] = 1;
+  req[1] = 0x04;
+  remus::blade::protocol::writeU32(req.data() + 2, 0x12345678);
+  remus::blade::protocol::writeU64(req.data() + 6, 0xAABBCCDDEEFF1122ULL);
+  
+  assert(req[0] == 1);
+  assert(req[1] == 0x04);
+  assert(remus::blade::protocol::readU32(req.data() + 2) == 0x12345678);
+  assert(remus::blade::protocol::readU64(req.data() + 6) == 0xAABBCCDDEEFF1122ULL);
+
+  // Response
+  std::array<uint8_t, 30> resp{};
+  resp[0] = 1;
+  resp[1] = 0x04;
+  remus::blade::protocol::writeU32(resp.data() + 2, 0x12345678);
+  remus::blade::protocol::writeU64(resp.data() + 6, 0xAABBCCDDEEFF1122ULL);
+  remus::blade::protocol::writeU64(resp.data() + 14, 0x1122334455667788ULL);
+  remus::blade::protocol::writeU64(resp.data() + 22, 0x99AABBCCDDEEFF00ULL);
+
+  assert(resp[0] == 1);
+  assert(resp[1] == 0x04);
+  assert(remus::blade::protocol::readU32(resp.data() + 2) == 0x12345678);
+  assert(remus::blade::protocol::readU64(resp.data() + 6) == 0xAABBCCDDEEFF1122ULL);
+  assert(remus::blade::protocol::readU64(resp.data() + 14) == 0x1122334455667788ULL);
+  assert(remus::blade::protocol::readU64(resp.data() + 22) == 0x99AABBCCDDEEFF00ULL);
+}
+
+// MPU Range conversion references
+enum class MockAccelRange : uint8_t { G8 = 8, G16 = 16 };
+enum class MockGyroRange : uint16_t { Dps500 = 500, Dps1000 = 1000, Dps2000 = 2000 };
+
+uint8_t getAccelRegisterValue(MockAccelRange range) {
+  return range == MockAccelRange::G16 ? 0x18 : 0x10;
+}
+
+float getAccelScaleFactor(MockAccelRange range) {
+  return range == MockAccelRange::G16 ? 2048.0f : 4096.0f;
+}
+
+uint8_t getGyroRegisterValue(MockGyroRange range) {
+  return range == MockGyroRange::Dps2000 ? 0x18 :
+         range == MockGyroRange::Dps1000 ? 0x10 : 0x08;
+}
+
+float getGyroScaleFactor(MockGyroRange range) {
+  return range == MockGyroRange::Dps2000 ? 16.4f :
+         range == MockGyroRange::Dps1000 ? 32.8f : 65.5f;
+}
+
+void testMpuRange() {
+  assert(getAccelRegisterValue(MockAccelRange::G16) == 0x18);
+  assert(getAccelScaleFactor(MockAccelRange::G16) == 2048.0f);
+
+  assert(getAccelRegisterValue(MockAccelRange::G8) == 0x10);
+  assert(getAccelScaleFactor(MockAccelRange::G8) == 4096.0f);
+
+  assert(getGyroRegisterValue(MockGyroRange::Dps2000) == 0x18);
+  assert(getGyroScaleFactor(MockGyroRange::Dps2000) == 16.4f);
+
+  assert(getGyroRegisterValue(MockGyroRange::Dps1000) == 0x10);
+  assert(getGyroScaleFactor(MockGyroRange::Dps1000) == 32.8f);
+
+  assert(getGyroRegisterValue(MockGyroRange::Dps500) == 0x08);
+  assert(getGyroScaleFactor(MockGyroRange::Dps500) == 65.5f);
+}
 
 int main() {
   uint8_t u64Bytes[8]{};
@@ -45,6 +184,10 @@ int main() {
   assert(protocol::readU16(relayed.data() + 10) == length);
   assert(protocol::readU32(relayed.data() + relayedLength - 4) ==
          protocol::crc32(relayed.data(), relayedLength - 4));
+
+  testDeviceInfoV2();
+  testClockSyncCodec();
+  testMpuRange();
 
   std::cout << "blade_protocol_smoke OK\n";
 }
