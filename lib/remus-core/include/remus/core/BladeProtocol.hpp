@@ -61,7 +61,6 @@ inline void writeU16(uint8_t* out, uint16_t value) {
   out[0] = static_cast<uint8_t>(value);
   out[1] = static_cast<uint8_t>(value >> 8);
 }
-
 inline void writeU32(uint8_t* out, uint32_t value) {
   for (size_t i = 0; i < 4; ++i) out[i] = static_cast<uint8_t>(value >> (i * 8));
 }
@@ -172,6 +171,31 @@ inline size_t encodeRelayedPacket(uint8_t* out, size_t capacity,
   writeU32(out + kRelayHeaderSize + payloadLength,
            crc32(out, kRelayHeaderSize + payloadLength));
   return required;
+}
+
+// Microsecond Clock Architecture:
+// All monotonic clocks on the wire (nativeTimestampUs, hostSendUs, sensorReceiveUs,
+// sensorSendUs) are 64-bit integers (readU64/writeU64). On ESP32, this matches
+// esp_timer_get_time() which is a true 64-bit microsecond counter.
+// A 64-bit microsecond counter wraps only after >584,000 years, completely eliminating
+// the 71.58-minute wrap ambiguity that occurs with 32-bit microsecond counters.
+inline constexpr size_t kClockSyncV1ResponseSize = 30;
+inline constexpr size_t kClockSyncV2ResponseSize = 34;
+inline constexpr uint8_t kDeviceInfoVersion3 = 3;
+
+inline size_t encodeClockSyncResponse(uint8_t* out, size_t capacity,
+                                      uint32_t requestId, uint64_t hostSendUs,
+                                      uint64_t sensorReceiveUs, uint64_t sensorSendUs,
+                                      uint32_t deviceBootId) {
+  if (!out || capacity < kClockSyncV2ResponseSize) return 0;
+  out[0] = kVersion;
+  out[1] = static_cast<uint8_t>(MessageType::ClockSyncResponse);
+  writeU32(out + 2, requestId);
+  writeU64(out + 6, hostSendUs);
+  writeU64(out + 14, sensorReceiveUs);
+  writeU64(out + 22, sensorSendUs);
+  writeU32(out + 30, deviceBootId);
+  return kClockSyncV2ResponseSize;
 }
 
 }  // namespace remus::blade::protocol

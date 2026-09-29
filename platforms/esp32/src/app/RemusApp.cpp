@@ -53,7 +53,7 @@
 #define BLADE_RELAY_CHARACTERISTIC_UUID "beb54844-36e1-4688-b7f5-ea07361b26a8"
 #define BLADE_CLOCK_SYNC_CHARACTERISTIC_UUID "beb54843-36e1-4688-b7f5-ea07361b26a8"
 #define DEVICE_INFO_CHARACTERISTIC_UUID "beb5483f-36e1-4688-b7f5-ea07361b26a8"
-#define REMUS_FIRMWARE_VERSION "1.4.0"
+#define REMUS_FIRMWARE_VERSION "2.1.0"
 
 #ifndef REMUS_ENABLE_BLADE_RELAY
 #define REMUS_ENABLE_BLADE_RELAY 1
@@ -81,6 +81,9 @@ remus::drivers::Gmt024Display displayDevice(
 
 remus::live::LiveSpmEstimator spmEstimator;
 float liveSpm = 0.0;
+const char* liveSpmState = "unavailable";
+char liveSpmReason[32] = "startup";
+uint32_t liveSpmSupportedTimestampMs = 0;
 
 // Display-only workout statistics. SPM uses half-stroke bins and pace uses
 // whole seconds per 500 m. Histograms give an exact running median with fixed
@@ -107,6 +110,7 @@ volatile bool bladeRosterDirty = true;
 bool oldBleConnected = false;
 char remusDeviceName[24] = "REMUS-ESP32";
 String remusDeviceSerial;
+uint32_t computerBootId = 0;
 
 void buildDeviceIdentity(uint64_t chipid) {
   Preferences identityPrefs;
@@ -120,14 +124,17 @@ void buildDeviceIdentity(uint64_t chipid) {
     identityPrefs.putString("serial", remusDeviceSerial);
   }
   identityPrefs.end();
+
+  computerBootId = esp_random();
+  if (computerBootId == 0) computerBootId = 1;
 }
 
 size_t encodeComputerDeviceInfo(uint8_t* out, size_t capacity) {
   const size_t serialLength = std::min<size_t>(remusDeviceSerial.length(), 31);
   constexpr size_t firmwareLength = sizeof(REMUS_FIRMWARE_VERSION) - 1;
-  const size_t required = 12 + serialLength + 1 + firmwareLength;
+  const size_t required = 16 + serialLength + 1 + firmwareLength;
   if (!out || capacity < required) return 0;
-  out[0] = 2;  // Device Info schema; IMU packet protocol remains v1.
+  out[0] = 3;  // Device Info schema v3 with deviceBootId; IMU packet protocol remains v1.
   out[1] = remus::blade::protocol::kDeviceFamilyComputer;
   out[2] = 1;
   out[3] = 1;
@@ -136,10 +143,11 @@ size_t encodeComputerDeviceInfo(uint8_t* out, size_t capacity) {
   out[8] = 1;  // +/-8 g.
   out[9] = 1;  // +/-500 dps.
   out[10] = imuDevice.dlpfSetting();
-  out[11] = static_cast<uint8_t>(serialLength);
-  memcpy(out + 12, remusDeviceSerial.c_str(), serialLength);
-  out[12 + serialLength] = static_cast<uint8_t>(firmwareLength);
-  memcpy(out + 13 + serialLength, REMUS_FIRMWARE_VERSION, firmwareLength);
+  remus::blade::protocol::writeU32(out + 11, computerBootId);
+  out[15] = static_cast<uint8_t>(serialLength);
+  memcpy(out + 16, remusDeviceSerial.c_str(), serialLength);
+  out[16 + serialLength] = static_cast<uint8_t>(firmwareLength);
+  memcpy(out + 17 + serialLength, REMUS_FIRMWARE_VERSION, firmwareLength);
   return required;
 }
 
@@ -283,6 +291,7 @@ struct BladeChannel {
   volatile unsigned long liveDropCount = 0;
   volatile bool storageFault = false;
   volatile uint32_t liveSequence = 0;
+  uint32_t deviceBootId = 0;
   remus::orientation::ClockMapping clockMapping{};
 };
 BladeChannel bladeChannels[BLADE_CHANNEL_COUNT]{};
@@ -710,6 +719,15 @@ void onBladeClockSyncNotification(BLERemoteCharacteristic* characteristic, uint8
   const int channelIndex = bladeChannelIndexForCharacteristic(characteristic);
   if (channelIndex < 0) return;
   BladeChannel& channel = bladeChannels[channelIndex];
+  if (length >= protocol::kClockSyncV2ResponseSize) {
+    const uint32_t incomingBootId = protocol::readU32(data + 30);
+    if (channel.deviceBootId != 0 && channel.deviceBootId != incomingBootId) {
+      portENTER_CRITICAL(&bladeClockMux);
+      channel.clockMapping = {};
+      portEXIT_CRITICAL(&bladeClockMux);
+    }
+    channel.deviceBootId = incomingBootId;
+  }
   const uint64_t computerReceiveUs = static_cast<uint64_t>(esp_timer_get_time());
   const uint64_t computerSendUs = protocol::readU64(data + 6);
   const uint64_t bladeReceiveUs = protocol::readU64(data + 14);
@@ -1449,6 +1467,9 @@ void startWorkoutRecording() {
 
   portENTER_CRITICAL(&telemetryMux);
   liveSpm = 0.0f;
+  liveSpmState = "unavailable";
+  snprintf(liveSpmReason, sizeof(liveSpmReason), "workout_started");
+  liveSpmSupportedTimestampMs = 0;
   lastImuLoop = 0;
   portEXIT_CRITICAL(&telemetryMux);
   resetDisplayStatistics();
@@ -1474,6 +1495,9 @@ void stopWorkoutRecording() {
 
   portENTER_CRITICAL(&telemetryMux);
   liveSpm = 0.0f;
+  liveSpmState = "unavailable";
+  snprintf(liveSpmReason, sizeof(liveSpmReason), "stopped");
+  liveSpmSupportedTimestampMs = 0;
   portEXIT_CRITICAL(&telemetryMux);
 
   if (!isWorkoutActive) {
@@ -2572,6 +2596,11 @@ void liveSpmProcessingTask(void* pvParameters) {
       const float currentSpm = (float)spmRes.stroke_rate_spm;
       portENTER_CRITICAL(&telemetryMux);
       liveSpm = currentSpm;
+      liveSpmState = spmRes.held ? "held" : "available";
+      snprintf(liveSpmReason, sizeof(liveSpmReason), "%s", spmRes.reason.c_str());
+      liveSpmSupportedTimestampMs = spmRes.supported_timestamp > 0.0
+        ? static_cast<uint32_t>(spmRes.supported_timestamp * 1000.0)
+        : sample.timestamp_ms;
       portEXIT_CRITICAL(&telemetryMux);
 
       // 0x03 continua significando um NOVO resultado aceito pelo estimator.
@@ -2601,6 +2630,9 @@ void liveSpmProcessingTask(void* pvParameters) {
       portENTER_CRITICAL(&telemetryMux);
       const bool stoppedFromActiveCadence = liveSpm > 0.0f;
       liveSpm = 0.0f;
+      liveSpmState = "unavailable";
+      snprintf(liveSpmReason, sizeof(liveSpmReason), "%s", spmRes.reason.c_str());
+      liveSpmSupportedTimestampMs = 0;
       portEXIT_CRITICAL(&telemetryMux);
 
       // Zero is evidence of a confirmed stop, not a substitute for an
@@ -2953,10 +2985,16 @@ static void remusAppTickImpl() {
     uint64_t now_us = esp_timer_get_time();
     float telemetryAx, telemetryAy, telemetryAz;
     float telemetryGx, telemetryGy, telemetryGz, telemetrySpm;
+    const char* telemetrySpmState;
+    char telemetrySpmReason[32];
+    uint32_t telemetrySpmSupportedTimestampMs;
     portENTER_CRITICAL(&telemetryMux);
     telemetryAx = ax; telemetryAy = ay; telemetryAz = az;
     telemetryGx = gx; telemetryGy = gy; telemetryGz = gz;
     telemetrySpm = liveSpm;
+    telemetrySpmState = liveSpmState;
+    snprintf(telemetrySpmReason, sizeof(telemetrySpmReason), "%s", liveSpmReason);
+    telemetrySpmSupportedTimestampMs = liveSpmSupportedTimestampMs;
     portEXIT_CRITICAL(&telemetryMux);
     const unsigned long writtenSnapshot = readCounter(&recordsPersisted);
     const unsigned long queuedSnapshot = readCounter(&recordsQueued);
@@ -2999,13 +3037,13 @@ static void remusAppTickImpl() {
     // 1. Transmissão BLE (notifica o app com telemetria ao vivo a 1 Hz)
     if (bleConnected && pCharacteristic) {
       if (kBladeRelayEnabled) notifyBladeRoster();
-      char bleBuf[400];
+      char bleBuf[448];
       char satsStr[32];
       snprintf(satsStr, sizeof(satsStr), "%d/%d:%d:%.1fm", satsInUse, satsInView, gpsDevice.maxSnr(), accuracyMeters);
 
       unsigned long charsRx = remus::hardware.hasGps ? gpsDevice.charsProcessed() : 0;
       if (hasFix) {
-        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,%.2f,%.5f,%.5f,%u,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%d,%lu",
+        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,%.2f,%.5f,%.5f,%u,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%d,%lu,%s,%s,%lu",
           (unsigned long)(now_us / 1000), telemetryAx, telemetryAy, telemetryAz, telemetryGx, telemetryGy, telemetryGz,
           gpsDevice.latitude(), gpsDevice.longitude(), gpsDevice.speedKmph(),
           satsStr, writtenSnapshot, charsRx, telemetrySpm,
@@ -3019,9 +3057,10 @@ static void remusAppTickImpl() {
           readCounter(&pcLiveQueueDropCount),
           anyBladeConnected ? 1 : 0,
           bladeNotifications, bladePacketsPersisted, bladeQueueDrops,
-          bladeWriteFailures, anyBladeStorageFault ? 1 : 0, bladeLiveDrops);
+          bladeWriteFailures, anyBladeStorageFault ? 1 : 0, bladeLiveDrops,
+          telemetrySpmState, telemetrySpmReason, (unsigned long)telemetrySpmSupportedTimestampMs);
       } else {
-        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,,,,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,,,,%u,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%d,%lu",
+        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,,,,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,,,,%u,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%d,%lu,%s,%s,%lu",
           (unsigned long)(now_us / 1000), telemetryAx, telemetryAy, telemetryAz, telemetryGx, telemetryGy, telemetryGz,
           satsStr, writtenSnapshot, charsRx, telemetrySpm,
           imuOk ? 1 : 0, sdOk ? 1 : 0, gapSnapshot, maxIntervalSnapshot,
@@ -3031,7 +3070,8 @@ static void remusAppTickImpl() {
           readCounter(&pcLiveQueueDropCount),
           anyBladeConnected ? 1 : 0,
           bladeNotifications, bladePacketsPersisted, bladeQueueDrops,
-          bladeWriteFailures, anyBladeStorageFault ? 1 : 0, bladeLiveDrops);
+          bladeWriteFailures, anyBladeStorageFault ? 1 : 0, bladeLiveDrops,
+          telemetrySpmState, telemetrySpmReason, (unsigned long)telemetrySpmSupportedTimestampMs);
       }
       pCharacteristic->setValue(bleBuf);
       pCharacteristic->notify();

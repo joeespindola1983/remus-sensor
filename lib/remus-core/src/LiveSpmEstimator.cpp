@@ -206,6 +206,7 @@ Result LiveSpmEstimator::holdOrRelease(Result result, double now, bool quiet) {
     result.stroke_rate_spm = last_valid_spm_;
     result.selected_axis = -1;
     result.reason = "held_" + result.reason;
+    result.supported_timestamp = last_valid_timestamp_;
     return result;
   }
 
@@ -213,6 +214,7 @@ Result LiveSpmEstimator::holdOrRelease(Result result, double now, bool quiet) {
     last_valid_spm_ = 0;
     last_valid_timestamp_ = -1;
   }
+  result.supported_timestamp = -1.0;
   return result;
 }
 
@@ -435,6 +437,7 @@ Result LiveSpmEstimator::estimate(double now) {
   result.held = false;
   result.stroke_rate_spm = selected.spm;
   result.reason.clear();
+  result.supported_timestamp = now;
 
   last_valid_spm_ = selected.spm;
   last_valid_timestamp_ = now;

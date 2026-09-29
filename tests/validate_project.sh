@@ -13,6 +13,13 @@ c++ -std=c++17 -O2 \
 "$TMP/core_smoke"
 
 c++ -std=c++17 -O2 \
+  -I"$ROOT/lib/remus-core/include" \
+  "$ROOT/tests/live_spm_estimator_test.cpp" \
+  "$ROOT/lib/remus-core/src/LiveSpmEstimator.cpp" \
+  -o "$TMP/live_spm_estimator_test"
+"$TMP/live_spm_estimator_test"
+
+c++ -std=c++17 -O2 \
   -I"$ROOT/platforms/esp32/include" \
   "$ROOT/tests/esp32_hardware_profile_smoke.cpp" \
   -o "$TMP/esp32_hardware_profile_smoke"
