@@ -22,6 +22,7 @@ struct Result {
   double progress = 0;
   int selected_axis = -1;         // -1 unknown/held, 0=X, 1=Y, 2=Z
   std::string reason = "collecting_window";
+  double supported_timestamp = -1.0; // timestamp of last actually supported estimate
 };
 
 inline bool shouldClearLivePresentation(const Result& result) {

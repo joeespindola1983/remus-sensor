@@ -23,12 +23,19 @@ inline constexpr size_t kRelayHeaderSize = 12;
 inline constexpr size_t kRelayCrcSize = 4;
 inline constexpr size_t kMaxRelayedPacketSize =
     kRelayHeaderSize + kMaxBatchSize + kRelayCrcSize;
+inline constexpr size_t kGpsObservationBytes = 40;
+inline constexpr size_t kGpsBatchHeaderSize = 23;
+inline constexpr size_t kGpsBatchCrcSize = 4;
+inline constexpr size_t kMaxGpsObservationsPerBatch = 2;
+inline constexpr size_t kMaxGpsBatchSize = kGpsBatchHeaderSize +
+    (kGpsObservationBytes * kMaxGpsObservationsPerBatch) + kGpsBatchCrcSize;
 
 enum class MessageType : uint8_t {
   ImuBatch = 0x01,
   Status = 0x02,
   ControlAck = 0x03,
   ClockSyncResponse = 0x04,
+  GpsObservationBatch = 0x05,
   Fragment = 0x11,
   RelayedPacket = 0x21,
 };
@@ -57,11 +64,27 @@ struct RawImuFrame {
   uint8_t status = 0;
 };
 
+struct RawGpsObservation {
+  uint32_t observationSequence = 0;
+  uint64_t nativeTimestampUs = 0;
+  uint32_t gpsTimeOfWeekMs = 0;
+  int32_t latitudeE7 = 0;
+  int32_t longitudeE7 = 0;
+  uint32_t groundSpeedCmPerSecond = 0;
+  uint32_t speedAccuracyCmPerSecond = 0;
+  int32_t courseDegreesE5 = 0;
+  uint32_t courseAccuracyDegreesE5 = 0;
+  uint32_t horizontalAccuracyMm = 0;
+  uint8_t satellitesInUse = 0;
+  uint8_t maximumSnrDbHz = 0;
+  uint8_t fixType = 0;
+  uint8_t flags = 0;
+};
+
 inline void writeU16(uint8_t* out, uint16_t value) {
   out[0] = static_cast<uint8_t>(value);
   out[1] = static_cast<uint8_t>(value >> 8);
 }
-
 inline void writeU32(uint8_t* out, uint32_t value) {
   for (size_t i = 0; i < 4; ++i) out[i] = static_cast<uint8_t>(value >> (i * 8));
 }
@@ -139,6 +162,49 @@ inline size_t encodeImuBatch(uint8_t* out, size_t capacity,
   return required;
 }
 
+inline size_t encodeGpsObservationBatch(
+    uint8_t* out, size_t capacity, uint32_t batchSequence,
+    const RawGpsObservation* observations, size_t observationCount) {
+  if (!out || !observations || observationCount == 0 ||
+      observationCount > kMaxGpsObservationsPerBatch) return 0;
+  const size_t required = kGpsBatchHeaderSize +
+      observationCount * kGpsObservationBytes + kGpsBatchCrcSize;
+  if (capacity < required) return 0;
+
+  out[0] = kVersion;
+  out[1] = static_cast<uint8_t>(MessageType::GpsObservationBatch);
+  out[2] = 0;
+  out[3] = static_cast<uint8_t>(kGpsBatchHeaderSize);
+  writeU32(out + 4, batchSequence);
+  writeU32(out + 8, observations[0].observationSequence);
+  writeU64(out + 12, observations[0].nativeTimestampUs);
+  out[20] = static_cast<uint8_t>(observationCount);
+  out[21] = static_cast<uint8_t>(kGpsObservationBytes);
+  out[22] = 0;
+
+  size_t offset = kGpsBatchHeaderSize;
+  for (size_t index = 0; index < observationCount; ++index) {
+    uint64_t deltaUs = observations[index].nativeTimestampUs -
+        observations[0].nativeTimestampUs;
+    if (deltaUs > UINT32_MAX) deltaUs = UINT32_MAX;
+    writeU32(out + offset, static_cast<uint32_t>(deltaUs)); offset += 4;
+    writeU32(out + offset, observations[index].gpsTimeOfWeekMs); offset += 4;
+    writeU32(out + offset, static_cast<uint32_t>(observations[index].latitudeE7)); offset += 4;
+    writeU32(out + offset, static_cast<uint32_t>(observations[index].longitudeE7)); offset += 4;
+    writeU32(out + offset, observations[index].groundSpeedCmPerSecond); offset += 4;
+    writeU32(out + offset, observations[index].speedAccuracyCmPerSecond); offset += 4;
+    writeU32(out + offset, static_cast<uint32_t>(observations[index].courseDegreesE5)); offset += 4;
+    writeU32(out + offset, observations[index].courseAccuracyDegreesE5); offset += 4;
+    writeU32(out + offset, observations[index].horizontalAccuracyMm); offset += 4;
+    out[offset++] = observations[index].satellitesInUse;
+    out[offset++] = observations[index].maximumSnrDbHz;
+    out[offset++] = observations[index].fixType;
+    out[offset++] = observations[index].flags;
+  }
+  writeU32(out + offset, crc32(out, offset));
+  return required;
+}
+
 inline size_t encodeFragment(uint8_t* out, size_t capacity,
                              uint32_t batchSequence, uint8_t fragmentIndex,
                              uint8_t fragmentCount, const uint8_t* payload,
@@ -172,6 +238,31 @@ inline size_t encodeRelayedPacket(uint8_t* out, size_t capacity,
   writeU32(out + kRelayHeaderSize + payloadLength,
            crc32(out, kRelayHeaderSize + payloadLength));
   return required;
+}
+
+// Microsecond Clock Architecture:
+// All monotonic clocks on the wire (nativeTimestampUs, hostSendUs, sensorReceiveUs,
+// sensorSendUs) are 64-bit integers (readU64/writeU64). On ESP32, this matches
+// esp_timer_get_time() which is a true 64-bit microsecond counter.
+// A 64-bit microsecond counter wraps only after >584,000 years, completely eliminating
+// the 71.58-minute wrap ambiguity that occurs with 32-bit microsecond counters.
+inline constexpr size_t kClockSyncV1ResponseSize = 30;
+inline constexpr size_t kClockSyncV2ResponseSize = 34;
+inline constexpr uint8_t kDeviceInfoVersion3 = 3;
+
+inline size_t encodeClockSyncResponse(uint8_t* out, size_t capacity,
+                                      uint32_t requestId, uint64_t hostSendUs,
+                                      uint64_t sensorReceiveUs, uint64_t sensorSendUs,
+                                      uint32_t deviceBootId) {
+  if (!out || capacity < kClockSyncV2ResponseSize) return 0;
+  out[0] = kVersion;
+  out[1] = static_cast<uint8_t>(MessageType::ClockSyncResponse);
+  writeU32(out + 2, requestId);
+  writeU64(out + 6, hostSendUs);
+  writeU64(out + 14, sensorReceiveUs);
+  writeU64(out + 22, sensorSendUs);
+  writeU32(out + 30, deviceBootId);
+  return kClockSyncV2ResponseSize;
 }
 
 }  // namespace remus::blade::protocol

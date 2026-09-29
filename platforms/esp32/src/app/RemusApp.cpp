@@ -49,11 +49,12 @@
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define IMU_STREAM_CHARACTERISTIC_UUID "beb54841-36e1-4688-b7f5-ea07361b26a8"
+#define GPS_STREAM_CHARACTERISTIC_UUID "beb54845-36e1-4688-b7f5-ea07361b26a8"
 #define BLADE_CONTROL_CHARACTERISTIC_UUID "beb54840-36e1-4688-b7f5-ea07361b26a8"
 #define BLADE_RELAY_CHARACTERISTIC_UUID "beb54844-36e1-4688-b7f5-ea07361b26a8"
 #define BLADE_CLOCK_SYNC_CHARACTERISTIC_UUID "beb54843-36e1-4688-b7f5-ea07361b26a8"
 #define DEVICE_INFO_CHARACTERISTIC_UUID "beb5483f-36e1-4688-b7f5-ea07361b26a8"
-#define REMUS_FIRMWARE_VERSION "1.4.0"
+#define REMUS_FIRMWARE_VERSION "2.2.0"
 
 #ifndef REMUS_ENABLE_BLADE_RELAY
 #define REMUS_ENABLE_BLADE_RELAY 1
@@ -81,6 +82,9 @@ remus::drivers::Gmt024Display displayDevice(
 
 remus::live::LiveSpmEstimator spmEstimator;
 float liveSpm = 0.0;
+const char* liveSpmState = "unavailable";
+char liveSpmReason[32] = "startup";
+uint32_t liveSpmSupportedTimestampMs = 0;
 
 // Display-only workout statistics. SPM uses half-stroke bins and pace uses
 // whole seconds per 500 m. Histograms give an exact running median with fixed
@@ -101,12 +105,15 @@ File bladeRelayFiles[2];
 BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
 BLECharacteristic* pImuStreamCharacteristic = NULL;
+BLECharacteristic* pGpsStreamCharacteristic = NULL;
 BLECharacteristic* pBladeRelayCharacteristic = NULL;
+BLECharacteristic* pClockSyncCharacteristic = NULL;
 volatile bool bleConnected = false;
 volatile bool bladeRosterDirty = true;
 bool oldBleConnected = false;
 char remusDeviceName[24] = "REMUS-ESP32";
 String remusDeviceSerial;
+uint32_t computerBootId = 0;
 
 void buildDeviceIdentity(uint64_t chipid) {
   Preferences identityPrefs;
@@ -120,26 +127,31 @@ void buildDeviceIdentity(uint64_t chipid) {
     identityPrefs.putString("serial", remusDeviceSerial);
   }
   identityPrefs.end();
+
+  computerBootId = esp_random();
+  if (computerBootId == 0) computerBootId = 1;
 }
 
 size_t encodeComputerDeviceInfo(uint8_t* out, size_t capacity) {
   const size_t serialLength = std::min<size_t>(remusDeviceSerial.length(), 31);
   constexpr size_t firmwareLength = sizeof(REMUS_FIRMWARE_VERSION) - 1;
-  const size_t required = 12 + serialLength + 1 + firmwareLength;
+  const size_t required = 16 + serialLength + 1 + firmwareLength;
   if (!out || capacity < required) return 0;
-  out[0] = 2;  // Device Info schema; IMU packet protocol remains v1.
+  out[0] = 3;  // Device Info schema v3 with deviceBootId; IMU packet protocol remains v1.
   out[1] = remus::blade::protocol::kDeviceFamilyComputer;
   out[2] = 1;
   out[3] = 1;
-  remus::blade::protocol::writeU16(out + 4, 0x001F);
+  // bit 5 declares the versioned live GNSS batch stream.
+  remus::blade::protocol::writeU16(out + 4, 0x003F);
   remus::blade::protocol::writeU16(out + 6, remus::hardware.imuRateHz);
   out[8] = 1;  // +/-8 g.
   out[9] = 1;  // +/-500 dps.
   out[10] = imuDevice.dlpfSetting();
-  out[11] = static_cast<uint8_t>(serialLength);
-  memcpy(out + 12, remusDeviceSerial.c_str(), serialLength);
-  out[12 + serialLength] = static_cast<uint8_t>(firmwareLength);
-  memcpy(out + 13 + serialLength, REMUS_FIRMWARE_VERSION, firmwareLength);
+  remus::blade::protocol::writeU32(out + 11, computerBootId);
+  out[15] = static_cast<uint8_t>(serialLength);
+  memcpy(out + 16, remusDeviceSerial.c_str(), serialLength);
+  out[16 + serialLength] = static_cast<uint8_t>(firmwareLength);
+  memcpy(out + 17 + serialLength, REMUS_FIRMWARE_VERSION, firmwareLength);
   return required;
 }
 
@@ -241,11 +253,18 @@ size_t persistedRecordBytesRemaining = 0;
 // explicit sequence gap, but it must never block the acquisition task or the
 // durable MicroSD path.
 QueueHandle_t pcLiveImuQueue = NULL;
+QueueHandle_t pcLiveGpsQueue = NULL;
 TaskHandle_t pcLiveImuTaskHandle = NULL;
 constexpr UBaseType_t PC_LIVE_IMU_QUEUE_LENGTH = 400;  // Two seconds at 200 Hz.
+constexpr UBaseType_t PC_LIVE_GPS_QUEUE_LENGTH = 16;   // >3 s at 5 Hz.
 volatile uint32_t pcLiveSampleSequence = 0;
 volatile uint32_t pcLiveBatchSequence = 0;
 volatile unsigned long pcLiveQueueDropCount = 0;
+volatile uint32_t pcLiveGpsObservationSequence = 0;
+volatile uint32_t pcLiveGpsBatchSequence = 0;
+volatile unsigned long pcLiveGpsQueueDropCount = 0;
+volatile unsigned long pcLiveGpsObservationCount = 0;
+volatile unsigned long pcLiveGpsBatchCount = 0;
 
 // The Computer is the primary BLE central for up to two Blades. The slot is a
 // user-declared role and is never inferred from discovery order. Original Blade
@@ -283,6 +302,7 @@ struct BladeChannel {
   volatile unsigned long liveDropCount = 0;
   volatile bool storageFault = false;
   volatile uint32_t liveSequence = 0;
+  uint32_t deviceBootId = 0;
   remus::orientation::ClockMapping clockMapping{};
 };
 BladeChannel bladeChannels[BLADE_CHANNEL_COUNT]{};
@@ -710,6 +730,15 @@ void onBladeClockSyncNotification(BLERemoteCharacteristic* characteristic, uint8
   const int channelIndex = bladeChannelIndexForCharacteristic(characteristic);
   if (channelIndex < 0) return;
   BladeChannel& channel = bladeChannels[channelIndex];
+  if (length >= protocol::kClockSyncV2ResponseSize) {
+    const uint32_t incomingBootId = protocol::readU32(data + 30);
+    if (channel.deviceBootId != 0 && channel.deviceBootId != incomingBootId) {
+      portENTER_CRITICAL(&bladeClockMux);
+      channel.clockMapping = {};
+      portEXIT_CRITICAL(&bladeClockMux);
+    }
+    channel.deviceBootId = incomingBootId;
+  }
   const uint64_t computerReceiveUs = static_cast<uint64_t>(esp_timer_get_time());
   const uint64_t computerSendUs = protocol::readU64(data + 6);
   const uint64_t bladeReceiveUs = protocol::readU64(data + 14);
@@ -1135,6 +1164,35 @@ class RemusCharacteristicCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// Phone-to-Computer clock exchange. This is deliberately separate from the
+// Computer-to-Blade client mappings: the phone, Computer and each Blade retain
+// independent clock domains and boot identities.
+class RemusClockSyncCallbacks final : public BLECharacteristicCallbacks {
+ public:
+  void onWrite(BLECharacteristic* characteristic) override {
+    namespace protocol = remus::blade::protocol;
+    const int64_t receivedAtUs = esp_timer_get_time();
+    const std::string value = characteristic->getValue();
+    if (value.size() < 14) return;
+
+    const uint8_t* request = reinterpret_cast<const uint8_t*>(value.data());
+    if (request[0] != protocol::kVersion ||
+        request[1] != static_cast<uint8_t>(protocol::MessageType::ClockSyncResponse)) {
+      return;
+    }
+
+    uint8_t response[protocol::kClockSyncV2ResponseSize]{};
+    const size_t responseLength = protocol::encodeClockSyncResponse(
+        response, sizeof(response), protocol::readU32(request + 2),
+        protocol::readU64(request + 6), static_cast<uint64_t>(receivedAtUs),
+        static_cast<uint64_t>(esp_timer_get_time()), computerBootId);
+    if (responseLength == 0 || !bleConnected) return;
+
+    characteristic->setValue(response, responseLength);
+    characteristic->notify();
+  }
+};
+
 void setupBLE() {
   uint64_t chipid = ESP.getEfuseMac();
   buildDeviceIdentity(chipid);
@@ -1170,6 +1228,20 @@ void setupBLE() {
                       BLECharacteristic::PROPERTY_NOTIFY
                     );
   pImuStreamCharacteristic->addDescriptor(new BLE2902());
+
+  pGpsStreamCharacteristic = pService->createCharacteristic(
+                      GPS_STREAM_CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pGpsStreamCharacteristic->addDescriptor(new BLE2902());
+
+  pClockSyncCharacteristic = pService->createCharacteristic(
+                      BLADE_CLOCK_SYNC_CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_WRITE |
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pClockSyncCharacteristic->addDescriptor(new BLE2902());
+  pClockSyncCharacteristic->setCallbacks(new RemusClockSyncCallbacks());
 
   if (kBladeRelayEnabled) {
     pBladeRelayCharacteristic = pService->createCharacteristic(
@@ -1392,6 +1464,12 @@ void startWorkoutRecording() {
   __atomic_store_n(&pcLiveSampleSequence, 0U, __ATOMIC_RELAXED);
   __atomic_store_n(&pcLiveBatchSequence, 0U, __ATOMIC_RELAXED);
   __atomic_store_n(&pcLiveQueueDropCount, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&pcLiveGpsObservationSequence, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&pcLiveGpsBatchSequence, 0U, __ATOMIC_RELAXED);
+  __atomic_store_n(&pcLiveGpsQueueDropCount, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&pcLiveGpsObservationCount, 0UL, __ATOMIC_RELAXED);
+  __atomic_store_n(&pcLiveGpsBatchCount, 0UL, __ATOMIC_RELAXED);
+  if (pcLiveGpsQueue) xQueueReset(pcLiveGpsQueue);
   for (BladeChannel& channel : bladeChannels) {
     __atomic_store_n(&channel.notificationsReceived, 0UL, __ATOMIC_RELAXED);
     __atomic_store_n(&channel.packetsPersisted, 0UL, __ATOMIC_RELAXED);
@@ -1449,6 +1527,9 @@ void startWorkoutRecording() {
 
   portENTER_CRITICAL(&telemetryMux);
   liveSpm = 0.0f;
+  liveSpmState = "unavailable";
+  snprintf(liveSpmReason, sizeof(liveSpmReason), "workout_started");
+  liveSpmSupportedTimestampMs = 0;
   lastImuLoop = 0;
   portEXIT_CRITICAL(&telemetryMux);
   resetDisplayStatistics();
@@ -1474,6 +1555,9 @@ void stopWorkoutRecording() {
 
   portENTER_CRITICAL(&telemetryMux);
   liveSpm = 0.0f;
+  liveSpmState = "unavailable";
+  snprintf(liveSpmReason, sizeof(liveSpmReason), "stopped");
+  liveSpmSupportedTimestampMs = 0;
   portEXIT_CRITICAL(&telemetryMux);
 
   if (!isWorkoutActive) {
@@ -2435,6 +2519,41 @@ void notifyPcLiveBatch(const uint8_t* batch, size_t batchLength, uint32_t batchS
   }
 }
 
+void notifyPcLiveGpsBatch(const uint8_t* batch, size_t batchLength, uint32_t batchSequence) {
+  namespace protocol = remus::blade::protocol;
+  if (!bleConnected || !pGpsStreamCharacteristic || !batch || batchLength == 0) return;
+  const size_t mtuPayload = BLEDevice::getMTU() > 3 ? BLEDevice::getMTU() - 3 : 20;
+  if (batchLength <= mtuPayload) {
+    pGpsStreamCharacteristic->setValue(const_cast<uint8_t*>(batch), batchLength);
+    pGpsStreamCharacteristic->notify();
+    incrementCounter(&pcLiveGpsBatchCount);
+    return;
+  }
+  if (mtuPayload <= protocol::kFragmentHeaderSize) {
+    incrementCounter(&pcLiveGpsQueueDropCount);
+    return;
+  }
+  const size_t fragmentPayload = mtuPayload - protocol::kFragmentHeaderSize;
+  const size_t fragmentCountSize = (batchLength + fragmentPayload - 1) / fragmentPayload;
+  if (fragmentCountSize > 255) {
+    incrementCounter(&pcLiveGpsQueueDropCount);
+    return;
+  }
+  std::array<uint8_t, 128> fragment{};
+  const uint8_t fragmentCount = static_cast<uint8_t>(fragmentCountSize);
+  for (uint8_t index = 0; index < fragmentCount && bleConnected; ++index) {
+    const size_t offset = static_cast<size_t>(index) * fragmentPayload;
+    const size_t length = std::min(fragmentPayload, batchLength - offset);
+    const size_t encoded = protocol::encodeFragment(
+      fragment.data(), fragment.size(), batchSequence, index, fragmentCount,
+      batch + offset, length);
+    pGpsStreamCharacteristic->setValue(fragment.data(), encoded);
+    pGpsStreamCharacteristic->notify();
+    taskYIELD();
+  }
+  incrementCounter(&pcLiveGpsBatchCount);
+}
+
 void notifyBladeRelayPacket(const BladeRelayPacket& packet) {
   namespace protocol = remus::blade::protocol;
   if (!bleConnected || !pBladeRelayCharacteristic || packet.length == 0) return;
@@ -2494,9 +2613,15 @@ void pcLiveImuStreamingTask(void*) {
   namespace protocol = remus::blade::protocol;
   std::array<protocol::RawImuFrame, protocol::kMaxSamplesPerBatch> samples{};
   std::array<uint8_t, protocol::kMaxBatchSize> encoded{};
+  std::array<protocol::RawGpsObservation, protocol::kMaxGpsObservationsPerBatch> gps{};
+  std::array<uint8_t, protocol::kMaxGpsBatchSize> encodedGps{};
+  size_t pendingGpsCount = 0;
+  uint32_t firstPendingGpsAtMs = 0;
   for (;;) {
     if (!isWorkoutActive || !bleConnected || !pcLiveImuQueue) {
       if (pcLiveImuQueue) xQueueReset(pcLiveImuQueue);
+      if (pcLiveGpsQueue) xQueueReset(pcLiveGpsQueue);
+      pendingGpsCount = 0;
       vTaskDelay(pdMS_TO_TICKS(20));
       continue;
     }
@@ -2514,6 +2639,24 @@ void pcLiveImuStreamingTask(void*) {
     const size_t length = protocol::encodeImuBatch(
       encoded.data(), encoded.size(), batchSequence, samples.data(), count);
     notifyPcLiveBatch(encoded.data(), length, batchSequence);
+
+    // GNSS is deliberately subordinate to IMU. At most one compact GPS batch
+    // is sent after an IMU batch, so radio pressure can never starve motion.
+    while (pcLiveGpsQueue && pendingGpsCount < gps.size() &&
+           xQueueReceive(pcLiveGpsQueue, &gps[pendingGpsCount], 0) == pdTRUE) {
+      if (pendingGpsCount == 0) firstPendingGpsAtMs = millis();
+      ++pendingGpsCount;
+    }
+    const bool gpsBatchReady = pendingGpsCount == gps.size() ||
+      (pendingGpsCount > 0 && millis() - firstPendingGpsAtMs >= 250);
+    if (gpsBatchReady) {
+      const uint32_t gpsBatchSequence = __atomic_fetch_add(
+        &pcLiveGpsBatchSequence, 1U, __ATOMIC_RELAXED);
+      const size_t gpsLength = protocol::encodeGpsObservationBatch(
+        encodedGps.data(), encodedGps.size(), gpsBatchSequence, gps.data(), pendingGpsCount);
+      notifyPcLiveGpsBatch(encodedGps.data(), gpsLength, gpsBatchSequence);
+      pendingGpsCount = 0;
+    }
   }
 }
 
@@ -2572,6 +2715,11 @@ void liveSpmProcessingTask(void* pvParameters) {
       const float currentSpm = (float)spmRes.stroke_rate_spm;
       portENTER_CRITICAL(&telemetryMux);
       liveSpm = currentSpm;
+      liveSpmState = spmRes.held ? "held" : "available";
+      snprintf(liveSpmReason, sizeof(liveSpmReason), "%s", spmRes.reason.c_str());
+      liveSpmSupportedTimestampMs = spmRes.supported_timestamp > 0.0
+        ? static_cast<uint32_t>(spmRes.supported_timestamp * 1000.0)
+        : sample.timestamp_ms;
       portEXIT_CRITICAL(&telemetryMux);
 
       // 0x03 continua significando um NOVO resultado aceito pelo estimator.
@@ -2601,6 +2749,9 @@ void liveSpmProcessingTask(void* pvParameters) {
       portENTER_CRITICAL(&telemetryMux);
       const bool stoppedFromActiveCadence = liveSpm > 0.0f;
       liveSpm = 0.0f;
+      liveSpmState = "unavailable";
+      snprintf(liveSpmReason, sizeof(liveSpmReason), "%s", spmRes.reason.c_str());
+      liveSpmSupportedTimestampMs = 0;
       portEXIT_CRITICAL(&telemetryMux);
 
       // Zero is evidence of a confirmed stop, not a substitute for an
@@ -2659,6 +2810,8 @@ static void remusAppBeginImpl() {
   liveSpmSampleQueue = xQueueCreate(LIVE_SPM_QUEUE_LENGTH, sizeof(LiveSpmInputSample));
   pcLiveImuQueue = xQueueCreate(
     PC_LIVE_IMU_QUEUE_LENGTH, sizeof(remus::blade::protocol::RawImuFrame));
+  pcLiveGpsQueue = xQueueCreate(
+    PC_LIVE_GPS_QUEUE_LENGTH, sizeof(remus::blade::protocol::RawGpsObservation));
   if (kBladeRelayEnabled) {
     bladeRelayQueue = xQueueCreate(BLADE_RELAY_QUEUE_LENGTH, sizeof(BladeRelayPacket));
   }
@@ -2677,6 +2830,12 @@ static void remusAppBeginImpl() {
       static_cast<unsigned int>(PC_LIVE_IMU_QUEUE_LENGTH));
   } else {
     Serial.println("[BLE] ⚠️ Stream bruto ao app indisponível; gravação local continua operacional.");
+  }
+  if (pcLiveGpsQueue) {
+    Serial.printf("[BLE] ✅ Fila GNSS 5 Hz alocada (%u observações).\n",
+      static_cast<unsigned int>(PC_LIVE_GPS_QUEUE_LENGTH));
+  } else {
+    Serial.println("[BLE] ⚠️ Stream GNSS ao app indisponível; IMU continua operacional.");
   }
   if (!kBladeRelayEnabled) {
     Serial.println("[BLADE RELAY] ⏸️ Desabilitado por configuração; Blades conectam direto ao iPhone.");
@@ -2856,6 +3015,33 @@ static void remusAppTickImpl() {
     }
     previousGpsItowMs = currentItowMs;
 
+    if (isWorkoutActive && bleConnected && pcLiveGpsQueue) {
+      remus::blade::protocol::RawGpsObservation liveGps{};
+      liveGps.observationSequence = __atomic_fetch_add(
+        &pcLiveGpsObservationSequence, 1U, __ATOMIC_RELAXED);
+      liveGps.nativeTimestampUs =
+        static_cast<uint64_t>(gpsDevice.navigationReceivedAtMs()) * 1000ULL;
+      liveGps.gpsTimeOfWeekMs = currentItowMs;
+      liveGps.latitudeE7 = static_cast<int32_t>(gpsDevice.latitude() * 1e7);
+      liveGps.longitudeE7 = static_cast<int32_t>(gpsDevice.longitude() * 1e7);
+      liveGps.groundSpeedCmPerSecond = gpsDevice.groundSpeedCmPerSecond();
+      liveGps.speedAccuracyCmPerSecond = gpsDevice.speedAccuracyCmPerSecond();
+      liveGps.courseDegreesE5 = gpsDevice.courseDegreesE5();
+      liveGps.courseAccuracyDegreesE5 = gpsDevice.courseAccuracyDegreesE5();
+      liveGps.horizontalAccuracyMm = gpsDevice.enhancedNavigationAvailable()
+        ? gpsDevice.horizontalAccuracyMm()
+        : static_cast<uint32_t>(gpsDevice.hdop() * 2500.0f);
+      liveGps.satellitesInUse = gpsDevice.satellitesInUse();
+      liveGps.maximumSnrDbHz = static_cast<uint8_t>(gpsDevice.maxSnr());
+      liveGps.fixType = gpsDevice.fixType();
+      liveGps.flags = validFix ? 0x01 : 0x00;
+      if (xQueueSend(pcLiveGpsQueue, &liveGps, 0) == pdTRUE) {
+        incrementCounter(&pcLiveGpsObservationCount);
+      } else {
+        incrementCounter(&pcLiveGpsQueueDropCount);
+      }
+    }
+
     if (validFix) {
       fixCount++;
       gpsSnapshotDirty = true;
@@ -2953,10 +3139,16 @@ static void remusAppTickImpl() {
     uint64_t now_us = esp_timer_get_time();
     float telemetryAx, telemetryAy, telemetryAz;
     float telemetryGx, telemetryGy, telemetryGz, telemetrySpm;
+    const char* telemetrySpmState;
+    char telemetrySpmReason[32];
+    uint32_t telemetrySpmSupportedTimestampMs;
     portENTER_CRITICAL(&telemetryMux);
     telemetryAx = ax; telemetryAy = ay; telemetryAz = az;
     telemetryGx = gx; telemetryGy = gy; telemetryGz = gz;
     telemetrySpm = liveSpm;
+    telemetrySpmState = liveSpmState;
+    snprintf(telemetrySpmReason, sizeof(telemetrySpmReason), "%s", liveSpmReason);
+    telemetrySpmSupportedTimestampMs = liveSpmSupportedTimestampMs;
     portEXIT_CRITICAL(&telemetryMux);
     const unsigned long writtenSnapshot = readCounter(&recordsPersisted);
     const unsigned long queuedSnapshot = readCounter(&recordsQueued);
@@ -2999,13 +3191,13 @@ static void remusAppTickImpl() {
     // 1. Transmissão BLE (notifica o app com telemetria ao vivo a 1 Hz)
     if (bleConnected && pCharacteristic) {
       if (kBladeRelayEnabled) notifyBladeRoster();
-      char bleBuf[400];
+      char bleBuf[448];
       char satsStr[32];
       snprintf(satsStr, sizeof(satsStr), "%d/%d:%d:%.1fm", satsInUse, satsInView, gpsDevice.maxSnr(), accuracyMeters);
 
       unsigned long charsRx = remus::hardware.hasGps ? gpsDevice.charsProcessed() : 0;
       if (hasFix) {
-        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,%.2f,%.5f,%.5f,%u,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%d,%lu",
+        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.6f,%.6f,%.2f,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,%.2f,%.5f,%.5f,%u,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%d,%lu,%s,%s,%lu",
           (unsigned long)(now_us / 1000), telemetryAx, telemetryAy, telemetryAz, telemetryGx, telemetryGy, telemetryGz,
           gpsDevice.latitude(), gpsDevice.longitude(), gpsDevice.speedKmph(),
           satsStr, writtenSnapshot, charsRx, telemetrySpm,
@@ -3019,9 +3211,10 @@ static void remusAppTickImpl() {
           readCounter(&pcLiveQueueDropCount),
           anyBladeConnected ? 1 : 0,
           bladeNotifications, bladePacketsPersisted, bladeQueueDrops,
-          bladeWriteFailures, anyBladeStorageFault ? 1 : 0, bladeLiveDrops);
+          bladeWriteFailures, anyBladeStorageFault ? 1 : 0, bladeLiveDrops,
+          telemetrySpmState, telemetrySpmReason, (unsigned long)telemetrySpmSupportedTimestampMs);
       } else {
-        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,,,,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,,,,%u,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%d,%lu",
+        snprintf(bleBuf, sizeof(bleBuf), "%lu,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,,,,%s,%lu,%lu,%.1f,%d,%d,%lu,%lu,%lu,%lu,,,,%u,%lu,%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%d,%lu,%s,%s,%lu",
           (unsigned long)(now_us / 1000), telemetryAx, telemetryAy, telemetryAz, telemetryGx, telemetryGy, telemetryGz,
           satsStr, writtenSnapshot, charsRx, telemetrySpm,
           imuOk ? 1 : 0, sdOk ? 1 : 0, gapSnapshot, maxIntervalSnapshot,
@@ -3031,7 +3224,8 @@ static void remusAppTickImpl() {
           readCounter(&pcLiveQueueDropCount),
           anyBladeConnected ? 1 : 0,
           bladeNotifications, bladePacketsPersisted, bladeQueueDrops,
-          bladeWriteFailures, anyBladeStorageFault ? 1 : 0, bladeLiveDrops);
+          bladeWriteFailures, anyBladeStorageFault ? 1 : 0, bladeLiveDrops,
+          telemetrySpmState, telemetrySpmReason, (unsigned long)telemetrySpmSupportedTimestampMs);
       }
       pCharacteristic->setValue(bleBuf);
       pCharacteristic->notify();

@@ -242,7 +242,14 @@ void RemusPiApp::spmLoop() {
         storage_.writeSpm(rec);
       }
     } else if (remus::live::shouldClearLivePresentation(result)) {
-      liveSpm_.store(0.0f);
+      const bool stoppedFromActiveCadence = liveSpm_.exchange(0.0f) > 0.0f;
+      if (result.reason == "recent_quiet" && stoppedFromActiveCadence) {
+        session::SpmRecord rec{};
+        rec.type = 0x03;
+        rec.timestamp_ms = millisSinceBoot();
+        rec.spm_x10 = 0;
+        storage_.writeSpm(rec);
+      }
     }
   }
 }

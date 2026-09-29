@@ -24,8 +24,8 @@ namespace {
 
 namespace protocol = remus::blade::protocol;
 
-constexpr char kFirmwareVersion[] = "1.4.0";
-constexpr uint8_t kDeviceInfoVersion = 2;
+constexpr char kFirmwareVersion[] = "2.1.0";
+constexpr uint8_t kDeviceInfoVersion = 3;
 constexpr char kServiceUuid[] = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
 constexpr char kDeviceInfoUuid[] = "beb5483f-36e1-4688-b7f5-ea07361b26a8";
 constexpr char kControlUuid[] = "beb54840-36e1-4688-b7f5-ea07361b26a8";
@@ -61,6 +61,7 @@ volatile uint32_t notificationErrorCount = 0;
 
 String deviceSerial;
 char deviceName[32] = "REMUS-BLD-DEV";
+uint32_t deviceBootId = 0;
 
 uint32_t atomicRead(const volatile uint32_t* value) {
   return __atomic_load_n(value, __ATOMIC_RELAXED);
@@ -87,12 +88,15 @@ void buildIdentity() {
       reinterpret_cast<const uint8_t*>(deviceSerial.c_str()), deviceSerial.length());
   snprintf(deviceName, sizeof(deviceName), "REMUS-BLD-%08lX",
            static_cast<unsigned long>(shortHash));
+
+  deviceBootId = esp_random();
+  if (deviceBootId == 0) deviceBootId = 1;
 }
 
 size_t encodeDeviceInfo(uint8_t* out, size_t capacity) {
   const size_t serialLength = std::min<size_t>(deviceSerial.length(), 31);
   const size_t firmwareLength = sizeof(kFirmwareVersion) - 1;
-  const size_t required = 12 + serialLength + 1 + firmwareLength;
+  const size_t required = 16 + serialLength + 1 + firmwareLength;
   if (!out || capacity < required) return 0;
 
   out[0] = kDeviceInfoVersion;
@@ -104,10 +108,11 @@ size_t encodeDeviceInfo(uint8_t* out, size_t capacity) {
   out[8] = 2;  // +/-16 g configuration identifier.
   out[9] = 3;  // +/-2000 dps configuration identifier.
   out[10] = imuDevice.dlpfSetting();
-  out[11] = static_cast<uint8_t>(serialLength);
-  memcpy(out + 12, deviceSerial.c_str(), serialLength);
-  out[12 + serialLength] = static_cast<uint8_t>(firmwareLength);
-  memcpy(out + 13 + serialLength, kFirmwareVersion, firmwareLength);
+  protocol::writeU32(out + 11, deviceBootId);
+  out[15] = static_cast<uint8_t>(serialLength);
+  memcpy(out + 16, deviceSerial.c_str(), serialLength);
+  out[16 + serialLength] = static_cast<uint8_t>(firmwareLength);
+  memcpy(out + 17 + serialLength, kFirmwareVersion, firmwareLength);
   return required;
 }
 
@@ -198,14 +203,18 @@ class ClockSyncCallbacks final : public BLECharacteristicCallbacks {
     const std::string value = characteristic->getValue();
     if (value.size() < 14 || static_cast<uint8_t>(value[0]) != protocol::kVersion) return;
     const uint8_t* request = reinterpret_cast<const uint8_t*>(value.data());
-    uint8_t response[30]{};
-    response[0] = protocol::kVersion;
-    response[1] = static_cast<uint8_t>(protocol::MessageType::ClockSyncResponse);
-    memcpy(response + 2, request + 2, 12);  // request ID + phone t1.
-    protocol::writeU64(response + 14, static_cast<uint64_t>(receivedAtUs));
-    protocol::writeU64(response + 22, static_cast<uint64_t>(esp_timer_get_time()));
-    characteristic->setValue(response, sizeof(response));
-    characteristic->notify();
+    uint8_t response[protocol::kClockSyncV2ResponseSize]{};
+    const uint32_t requestId = protocol::readU32(request + 2);
+    const uint64_t hostSendUs = protocol::readU64(request + 6);
+    const size_t responseLen = protocol::encodeClockSyncResponse(
+        response, sizeof(response), requestId, hostSendUs,
+        static_cast<uint64_t>(receivedAtUs),
+        static_cast<uint64_t>(esp_timer_get_time()),
+        deviceBootId);
+    if (responseLen > 0) {
+      characteristic->setValue(response, responseLen);
+      characteristic->notify();
+    }
   }
 };
 
