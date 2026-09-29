@@ -23,12 +23,19 @@ inline constexpr size_t kRelayHeaderSize = 12;
 inline constexpr size_t kRelayCrcSize = 4;
 inline constexpr size_t kMaxRelayedPacketSize =
     kRelayHeaderSize + kMaxBatchSize + kRelayCrcSize;
+inline constexpr size_t kGpsObservationBytes = 40;
+inline constexpr size_t kGpsBatchHeaderSize = 23;
+inline constexpr size_t kGpsBatchCrcSize = 4;
+inline constexpr size_t kMaxGpsObservationsPerBatch = 2;
+inline constexpr size_t kMaxGpsBatchSize = kGpsBatchHeaderSize +
+    (kGpsObservationBytes * kMaxGpsObservationsPerBatch) + kGpsBatchCrcSize;
 
 enum class MessageType : uint8_t {
   ImuBatch = 0x01,
   Status = 0x02,
   ControlAck = 0x03,
   ClockSyncResponse = 0x04,
+  GpsObservationBatch = 0x05,
   Fragment = 0x11,
   RelayedPacket = 0x21,
 };
@@ -55,6 +62,23 @@ struct RawImuFrame {
   int16_t gy = 0;
   int16_t gz = 0;
   uint8_t status = 0;
+};
+
+struct RawGpsObservation {
+  uint32_t observationSequence = 0;
+  uint64_t nativeTimestampUs = 0;
+  uint32_t gpsTimeOfWeekMs = 0;
+  int32_t latitudeE7 = 0;
+  int32_t longitudeE7 = 0;
+  uint32_t groundSpeedCmPerSecond = 0;
+  uint32_t speedAccuracyCmPerSecond = 0;
+  int32_t courseDegreesE5 = 0;
+  uint32_t courseAccuracyDegreesE5 = 0;
+  uint32_t horizontalAccuracyMm = 0;
+  uint8_t satellitesInUse = 0;
+  uint8_t maximumSnrDbHz = 0;
+  uint8_t fixType = 0;
+  uint8_t flags = 0;
 };
 
 inline void writeU16(uint8_t* out, uint16_t value) {
@@ -133,6 +157,49 @@ inline size_t encodeImuBatch(uint8_t* out, size_t capacity,
     writeU16(out + offset, static_cast<uint16_t>(static_cast<int16_t>(jitterUs)));
     offset += 2;
     out[offset++] = samples[i].status;
+  }
+  writeU32(out + offset, crc32(out, offset));
+  return required;
+}
+
+inline size_t encodeGpsObservationBatch(
+    uint8_t* out, size_t capacity, uint32_t batchSequence,
+    const RawGpsObservation* observations, size_t observationCount) {
+  if (!out || !observations || observationCount == 0 ||
+      observationCount > kMaxGpsObservationsPerBatch) return 0;
+  const size_t required = kGpsBatchHeaderSize +
+      observationCount * kGpsObservationBytes + kGpsBatchCrcSize;
+  if (capacity < required) return 0;
+
+  out[0] = kVersion;
+  out[1] = static_cast<uint8_t>(MessageType::GpsObservationBatch);
+  out[2] = 0;
+  out[3] = static_cast<uint8_t>(kGpsBatchHeaderSize);
+  writeU32(out + 4, batchSequence);
+  writeU32(out + 8, observations[0].observationSequence);
+  writeU64(out + 12, observations[0].nativeTimestampUs);
+  out[20] = static_cast<uint8_t>(observationCount);
+  out[21] = static_cast<uint8_t>(kGpsObservationBytes);
+  out[22] = 0;
+
+  size_t offset = kGpsBatchHeaderSize;
+  for (size_t index = 0; index < observationCount; ++index) {
+    uint64_t deltaUs = observations[index].nativeTimestampUs -
+        observations[0].nativeTimestampUs;
+    if (deltaUs > UINT32_MAX) deltaUs = UINT32_MAX;
+    writeU32(out + offset, static_cast<uint32_t>(deltaUs)); offset += 4;
+    writeU32(out + offset, observations[index].gpsTimeOfWeekMs); offset += 4;
+    writeU32(out + offset, static_cast<uint32_t>(observations[index].latitudeE7)); offset += 4;
+    writeU32(out + offset, static_cast<uint32_t>(observations[index].longitudeE7)); offset += 4;
+    writeU32(out + offset, observations[index].groundSpeedCmPerSecond); offset += 4;
+    writeU32(out + offset, observations[index].speedAccuracyCmPerSecond); offset += 4;
+    writeU32(out + offset, static_cast<uint32_t>(observations[index].courseDegreesE5)); offset += 4;
+    writeU32(out + offset, observations[index].courseAccuracyDegreesE5); offset += 4;
+    writeU32(out + offset, observations[index].horizontalAccuracyMm); offset += 4;
+    out[offset++] = observations[index].satellitesInUse;
+    out[offset++] = observations[index].maximumSnrDbHz;
+    out[offset++] = observations[index].fixType;
+    out[offset++] = observations[index].flags;
   }
   writeU32(out + offset, crc32(out, offset));
   return required;

@@ -219,6 +219,27 @@ int main() {
   const uint32_t expectedCrc = protocol::crc32(bytes.data(), length - 4);
   assert(protocol::readU32(bytes.data() + length - 4) == expectedCrc);
 
+  std::array<protocol::RawGpsObservation, 2> gps{};
+  gps[0] = {100, 5000000ULL, 216507200, -157490560, -478697480,
+            119, 27, 32361581, 4156269, 1400, 10, 43, 3, 1};
+  gps[1] = {101, 5200000ULL, 216507400, -157490590, -478697490,
+            126, 25, 32361581, 4160247, 1300, 11, 44, 3, 1};
+  std::array<uint8_t, protocol::kMaxGpsBatchSize> gpsBytes{};
+  const size_t gpsLength = protocol::encodeGpsObservationBatch(
+      gpsBytes.data(), gpsBytes.size(), 9, gps.data(), gps.size());
+  assert(gpsLength == 107);
+  assert(gpsBytes[0] == protocol::kVersion);
+  assert(gpsBytes[1] == static_cast<uint8_t>(protocol::MessageType::GpsObservationBatch));
+  assert(protocol::readU32(gpsBytes.data() + 4) == 9);
+  assert(protocol::readU32(gpsBytes.data() + 8) == 100);
+  assert(protocol::readU64(gpsBytes.data() + 12) == 5000000ULL);
+  assert(gpsBytes[20] == 2);
+  assert(gpsBytes[21] == protocol::kGpsObservationBytes);
+  assert(protocol::readU32(gpsBytes.data() + 23) == 0);
+  assert(protocol::readU32(gpsBytes.data() + 63) == 200000);
+  assert(protocol::readU32(gpsBytes.data() + gpsLength - 4) ==
+         protocol::crc32(gpsBytes.data(), gpsLength - 4));
+
   std::array<uint8_t, 32> fragment{};
   const size_t fragmentLength = protocol::encodeFragment(
       fragment.data(), fragment.size(), 7, 0, 2, bytes.data(), 20);
