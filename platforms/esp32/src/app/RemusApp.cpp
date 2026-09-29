@@ -54,12 +54,26 @@
 #define BLADE_RELAY_CHARACTERISTIC_UUID "beb54844-36e1-4688-b7f5-ea07361b26a8"
 #define BLADE_CLOCK_SYNC_CHARACTERISTIC_UUID "beb54843-36e1-4688-b7f5-ea07361b26a8"
 #define DEVICE_INFO_CHARACTERISTIC_UUID "beb5483f-36e1-4688-b7f5-ea07361b26a8"
+#ifndef REMUS_AUTOSTART_LOCAL_CAPTURE
+#define REMUS_AUTOSTART_LOCAL_CAPTURE 0
+#endif
+
+#if REMUS_AUTOSTART_LOCAL_CAPTURE
+#define REMUS_FIRMWARE_VERSION "2.3.0-field.1"
+#else
 #define REMUS_FIRMWARE_VERSION "2.2.0"
+#endif
+
+#ifndef REMUS_LOCAL_FLUSH_INTERVAL_MS
+#define REMUS_LOCAL_FLUSH_INTERVAL_MS 60000
+#endif
 
 #ifndef REMUS_ENABLE_BLADE_RELAY
 #define REMUS_ENABLE_BLADE_RELAY 1
 #endif
 constexpr bool kBladeRelayEnabled = REMUS_ENABLE_BLADE_RELAY != 0;
+constexpr bool kAutostartLocalCapture = REMUS_AUTOSTART_LOCAL_CAPTURE != 0;
+constexpr unsigned long kLocalFlushIntervalMs = REMUS_LOCAL_FLUSH_INTERVAL_MS;
 
 // Binary session records live in remus-core and are shared with Prototype 2.
 using RemusFileHeader = remus::session::FileHeader;
@@ -2935,6 +2949,23 @@ static void remusAppBeginImpl() {
 
   // 9. Exibe relatório persistido em Flash NVS
   printSavedReport();
+
+  // The field-test profile starts only when every local persistence component
+  // required for PC + dual-Blade custody is ready. Ordinary release builds keep
+  // the existing explicit START behavior.
+  if (kAutostartLocalCapture) {
+    const bool autonomousReady = imuOk && sdOk && s_recordingRingBuf &&
+      recordingStateMutex && bladeRelayQueue && bladeRelayClientTaskHandle;
+    if (autonomousReady) {
+      Serial.println("[FIELD] ✅ Perfil autônomo pronto; iniciando RBP2 e busca dos dois Blades.");
+      startWorkoutRecording();
+    } else {
+      Serial.printf(
+        "[FIELD] ❌ Autostart bloqueado: IMU=%d SD=%d buffer=%d relayQueue=%d relayTask=%d.\n",
+        imuOk ? 1 : 0, sdOk ? 1 : 0, s_recordingRingBuf ? 1 : 0,
+        bladeRelayQueue ? 1 : 0, bladeRelayClientTaskHandle ? 1 : 0);
+    }
+  }
 }
 
 void processControlCommands() {
@@ -3126,8 +3157,11 @@ static void remusAppTickImpl() {
     processBladeRelayStorage(8);
   }
 
-  // Flush periódico longo (apenas a cada 60s) para garantir integridade FAT em treinos longos
-  if (sdOk && isWorkoutActive && logFile && (now - lastFlush >= 60000)) {
+  // Release builds retain the 60 s interval. The autonomous field profile uses
+  // 5 s to limit the recoverable tail if the battery is disconnected without a
+  // clean STOP command.
+  if (sdOk && isWorkoutActive && logFile &&
+      (now - lastFlush >= kLocalFlushIntervalMs)) {
     lastFlush = now;
     logFile.flush();
     for (File& file : bladeRelayFiles) if (file) file.flush();

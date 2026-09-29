@@ -74,6 +74,23 @@ class TestPlatformioCustomTargets(unittest.TestCase):
             self.assertIn("--port", called_cmd)
             self.assertIn("/dev/cu.usbmodem101", called_cmd)
 
+    def test_autonomous_profile_is_explicit_and_does_not_change_release_default(self):
+        config_path = os.path.join(REPO_ROOT, "platformio.ini")
+        with open(config_path, encoding="utf-8") as handle:
+            config = handle.read()
+
+        release_start = config.index("[env:remus-proto1]")
+        autonomous_start = config.index("[env:remus-proto1-autonomous]")
+        blade_start = config.index("[env:remus-blade-dev]")
+        release_profile = config[release_start:autonomous_start]
+        autonomous_profile = config[autonomous_start:blade_start]
+
+        self.assertIn("REMUS_ENABLE_BLADE_RELAY=0", release_profile)
+        self.assertNotIn("REMUS_AUTOSTART_LOCAL_CAPTURE=1", release_profile)
+        self.assertIn("REMUS_ENABLE_BLADE_RELAY=1", autonomous_profile)
+        self.assertIn("REMUS_AUTOSTART_LOCAL_CAPTURE=1", autonomous_profile)
+        self.assertIn("REMUS_LOCAL_FLUSH_INTERVAL_MS=5000", autonomous_profile)
+
 
 if __name__ == "__main__":
     unittest.main()
