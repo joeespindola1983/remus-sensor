@@ -178,6 +178,12 @@ full-screen redraw during the 200 Hz acquisition path.
 The ESP32 profile configures the declared u-blox NEO-6M through UBX at 9600
 baud. Coherent NAV-POSLLH, NAV-VELNED and NAV-STATUS solutions run at 5 Hz;
 position and velocity are published only when their GPS time-of-week matches.
+During an active workout, the Computer also publishes these coherent solutions
+to the phone on the versioned binary GNSS characteristic
+`beb54845-36e1-4688-b7f5-ea07361b26a8`. Up to two 40-byte observations share a
+CRC-protected batch. This adds roughly 300 bytes/s at 5 Hz and is scheduled only
+after an IMU batch; a full GNSS queue drops GNSS rather than delaying 200 Hz IMU.
+The legacy textual snapshot remains at 1 Hz for compatibility.
 GGA/RMC remain at 1 Hz and GSV at low cadence for UTC and diagnostics. Boot
 should report that the receiver acknowledged UBX; if it does not,
 the firmware keeps parsing default NMEA but the module marking, wiring and

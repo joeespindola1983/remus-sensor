@@ -75,6 +75,46 @@ void testDeviceInfoV2() {
   assert(std::string(reinterpret_cast<const char*>(out.data() + 30), 5) == "1.4.0");
 }
 
+// Standalone encoder for testing Device Info v3
+size_t encodeDeviceInfoV3(uint8_t* out, size_t capacity, uint8_t family,
+                          uint8_t model, uint8_t hardware, uint16_t capabilities,
+                          uint16_t imuRateHz, uint8_t accelRange, uint8_t gyroRange,
+                          uint8_t dlpfSetting, uint32_t deviceBootId,
+                          const std::string& serial, const std::string& firmware) {
+  const size_t serialLength = std::min<size_t>(serial.length(), 31);
+  const size_t firmwareLength = firmware.length();
+  const size_t required = 16 + serialLength + 1 + firmwareLength;
+  if (!out || capacity < required) return 0;
+  out[0] = 3; // version 3
+  out[1] = family;
+  out[2] = model;
+  out[3] = hardware;
+  remus::blade::protocol::writeU16(out + 4, capabilities);
+  remus::blade::protocol::writeU16(out + 6, imuRateHz);
+  out[8] = accelRange;
+  out[9] = gyroRange;
+  out[10] = dlpfSetting;
+  remus::blade::protocol::writeU32(out + 11, deviceBootId);
+  out[15] = static_cast<uint8_t>(serialLength);
+  std::memcpy(out + 16, serial.c_str(), serialLength);
+  out[16 + serialLength] = static_cast<uint8_t>(firmwareLength);
+  std::memcpy(out + 17 + serialLength, firmware.c_str(), firmwareLength);
+  return required;
+}
+
+void testDeviceInfoV3() {
+  std::array<uint8_t, 128> out{};
+  size_t len = encodeDeviceInfoV3(out.data(), out.size(),
+                                  2, 1, 1, 0x0003, 200, 2, 3, 3, 0xA1B2C3D4,
+                                  "RB-D-001122334455", "1.4.0");
+  assert(len == 16 + 17 + 1 + 5);
+  assert(out[0] == 3);
+  assert(out[1] == 2);
+  assert(remus::blade::protocol::readU32(out.data() + 11) == 0xA1B2C3D4);
+  assert(out[15] == 17);
+  assert(std::string(reinterpret_cast<const char*>(out.data() + 16), 17) == "RB-D-001122334455");
+}
+
 void testClockSyncCodec() {
   // Request
   std::array<uint8_t, 14> req{};
@@ -88,7 +128,7 @@ void testClockSyncCodec() {
   assert(remus::blade::protocol::readU32(req.data() + 2) == 0x12345678);
   assert(remus::blade::protocol::readU64(req.data() + 6) == 0xAABBCCDDEEFF1122ULL);
 
-  // Response
+  // Response V1 (30 bytes legacy)
   std::array<uint8_t, 30> resp{};
   resp[0] = 1;
   resp[1] = 0x04;
@@ -103,6 +143,20 @@ void testClockSyncCodec() {
   assert(remus::blade::protocol::readU64(resp.data() + 6) == 0xAABBCCDDEEFF1122ULL);
   assert(remus::blade::protocol::readU64(resp.data() + 14) == 0x1122334455667788ULL);
   assert(remus::blade::protocol::readU64(resp.data() + 22) == 0x99AABBCCDDEEFF00ULL);
+
+  // Response V2 (34 bytes with deviceBootId)
+  std::array<uint8_t, 34> respV2{};
+  size_t v2Len = remus::blade::protocol::encodeClockSyncResponse(
+      respV2.data(), respV2.size(), 0x12345678, 0xAABBCCDDEEFF1122ULL,
+      0x1122334455667788ULL, 0x99AABBCCDDEEFF00ULL, 0xA1B2C3D4);
+  assert(v2Len == 34);
+  assert(respV2[0] == 1);
+  assert(respV2[1] == 0x04);
+  assert(remus::blade::protocol::readU32(respV2.data() + 2) == 0x12345678);
+  assert(remus::blade::protocol::readU64(respV2.data() + 6) == 0xAABBCCDDEEFF1122ULL);
+  assert(remus::blade::protocol::readU64(respV2.data() + 14) == 0x1122334455667788ULL);
+  assert(remus::blade::protocol::readU64(respV2.data() + 22) == 0x99AABBCCDDEEFF00ULL);
+  assert(remus::blade::protocol::readU32(respV2.data() + 30) == 0xA1B2C3D4);
 }
 
 // MPU Range conversion references
@@ -165,6 +219,27 @@ int main() {
   const uint32_t expectedCrc = protocol::crc32(bytes.data(), length - 4);
   assert(protocol::readU32(bytes.data() + length - 4) == expectedCrc);
 
+  std::array<protocol::RawGpsObservation, 2> gps{};
+  gps[0] = {100, 5000000ULL, 216507200, -157490560, -478697480,
+            119, 27, 32361581, 4156269, 1400, 10, 43, 3, 1};
+  gps[1] = {101, 5200000ULL, 216507400, -157490590, -478697490,
+            126, 25, 32361581, 4160247, 1300, 11, 44, 3, 1};
+  std::array<uint8_t, protocol::kMaxGpsBatchSize> gpsBytes{};
+  const size_t gpsLength = protocol::encodeGpsObservationBatch(
+      gpsBytes.data(), gpsBytes.size(), 9, gps.data(), gps.size());
+  assert(gpsLength == 107);
+  assert(gpsBytes[0] == protocol::kVersion);
+  assert(gpsBytes[1] == static_cast<uint8_t>(protocol::MessageType::GpsObservationBatch));
+  assert(protocol::readU32(gpsBytes.data() + 4) == 9);
+  assert(protocol::readU32(gpsBytes.data() + 8) == 100);
+  assert(protocol::readU64(gpsBytes.data() + 12) == 5000000ULL);
+  assert(gpsBytes[20] == 2);
+  assert(gpsBytes[21] == protocol::kGpsObservationBytes);
+  assert(protocol::readU32(gpsBytes.data() + 23) == 0);
+  assert(protocol::readU32(gpsBytes.data() + 63) == 200000);
+  assert(protocol::readU32(gpsBytes.data() + gpsLength - 4) ==
+         protocol::crc32(gpsBytes.data(), gpsLength - 4));
+
   std::array<uint8_t, 32> fragment{};
   const size_t fragmentLength = protocol::encodeFragment(
       fragment.data(), fragment.size(), 7, 0, 2, bytes.data(), 20);
@@ -186,6 +261,7 @@ int main() {
          protocol::crc32(relayed.data(), relayedLength - 4));
 
   testDeviceInfoV2();
+  testDeviceInfoV3();
   testClockSyncCodec();
   testMpuRange();
 
