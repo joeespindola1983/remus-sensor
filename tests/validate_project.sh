@@ -75,5 +75,6 @@ else
 fi
 
 python3 "$ROOT/tests/test_platformio_custom_targets.py"
+python3 "$ROOT/tests/test_remus_computer_clock_sync.py"
 
 echo "REMUS validation OK"

@@ -53,7 +53,7 @@
 #define BLADE_RELAY_CHARACTERISTIC_UUID "beb54844-36e1-4688-b7f5-ea07361b26a8"
 #define BLADE_CLOCK_SYNC_CHARACTERISTIC_UUID "beb54843-36e1-4688-b7f5-ea07361b26a8"
 #define DEVICE_INFO_CHARACTERISTIC_UUID "beb5483f-36e1-4688-b7f5-ea07361b26a8"
-#define REMUS_FIRMWARE_VERSION "2.1.0"
+#define REMUS_FIRMWARE_VERSION "2.1.1"
 
 #ifndef REMUS_ENABLE_BLADE_RELAY
 #define REMUS_ENABLE_BLADE_RELAY 1
@@ -105,6 +105,7 @@ BLEServer* pServer = NULL;
 BLECharacteristic* pCharacteristic = NULL;
 BLECharacteristic* pImuStreamCharacteristic = NULL;
 BLECharacteristic* pBladeRelayCharacteristic = NULL;
+BLECharacteristic* pClockSyncCharacteristic = NULL;
 volatile bool bleConnected = false;
 volatile bool bladeRosterDirty = true;
 bool oldBleConnected = false;
@@ -1153,6 +1154,35 @@ class RemusCharacteristicCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
+// Phone-to-Computer clock exchange. This is deliberately separate from the
+// Computer-to-Blade client mappings: the phone, Computer and each Blade retain
+// independent clock domains and boot identities.
+class RemusClockSyncCallbacks final : public BLECharacteristicCallbacks {
+ public:
+  void onWrite(BLECharacteristic* characteristic) override {
+    namespace protocol = remus::blade::protocol;
+    const int64_t receivedAtUs = esp_timer_get_time();
+    const std::string value = characteristic->getValue();
+    if (value.size() < 14) return;
+
+    const uint8_t* request = reinterpret_cast<const uint8_t*>(value.data());
+    if (request[0] != protocol::kVersion ||
+        request[1] != static_cast<uint8_t>(protocol::MessageType::ClockSyncResponse)) {
+      return;
+    }
+
+    uint8_t response[protocol::kClockSyncV2ResponseSize]{};
+    const size_t responseLength = protocol::encodeClockSyncResponse(
+        response, sizeof(response), protocol::readU32(request + 2),
+        protocol::readU64(request + 6), static_cast<uint64_t>(receivedAtUs),
+        static_cast<uint64_t>(esp_timer_get_time()), computerBootId);
+    if (responseLength == 0 || !bleConnected) return;
+
+    characteristic->setValue(response, responseLength);
+    characteristic->notify();
+  }
+};
+
 void setupBLE() {
   uint64_t chipid = ESP.getEfuseMac();
   buildDeviceIdentity(chipid);
@@ -1188,6 +1218,14 @@ void setupBLE() {
                       BLECharacteristic::PROPERTY_NOTIFY
                     );
   pImuStreamCharacteristic->addDescriptor(new BLE2902());
+
+  pClockSyncCharacteristic = pService->createCharacteristic(
+                      BLADE_CLOCK_SYNC_CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_WRITE |
+                      BLECharacteristic::PROPERTY_NOTIFY
+                    );
+  pClockSyncCharacteristic->addDescriptor(new BLE2902());
+  pClockSyncCharacteristic->setCallbacks(new RemusClockSyncCallbacks());
 
   if (kBladeRelayEnabled) {
     pBladeRelayCharacteristic = pService->createCharacteristic(
